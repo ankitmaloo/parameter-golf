@@ -1354,3 +1354,208 @@ for pass_idx in range(ttt_passes):
 6. **Parameter Banking is PR #593 only**: Other submissions (including merged SOTA #414) use standard per-layer CastedLinear modules. Banking is a PR #593/Parallel Muon innovation.
 
 7. **FA3 layout change**: FA3 requires [B, T, H, D] tensor layout (vs baseline's [B, H, T, D]). This changes the reshape/transpose in attention forward.
+
+---
+
+## UPDATE 2026-04-06: Competition Has Accelerated Dramatically
+
+The frontier has moved far beyond our last analysis. Merged SOTA is now **1.1147** (PR #1019), and open frontier is **1.079 BPB** (no SLOT) / **0.709 BPB** (with SLOT). Our gap is now **0.048 BPB** to merged SOTA.
+
+### Current Merged Leaderboard (as of 2026-04-06)
+
+| Rank | Score | PR | Key Techniques |
+|------|-------|----|----------------|
+| 1 | 1.1147 | #1019 | AR Self-Gen GPTQ, XSA-all 11 layers, BigramHash 3072×112, Parallel Muon, LeakyReLU², EMA, no TTT |
+| 2 | 1.1194 | #549 | LeakyReLU², Legal Score-First TTT, Parallel Muon |
+| 3 | 1.1233 | #414 | 11L, GPTQ-lite, EMA, XSA4, Partial RoPE, LN Scale, VE128, Late QAT |
+| ... | ... | ... | ... |
+| ~20 | 1.1631 | ours | SOTA stack + batch 524K |
+
+### Open Frontier PRs (2026-04-06)
+
+| Score | PR | Key Techniques | TTT? | SLOT? |
+|-------|-----|----------------|------|-------|
+| 0.7094 | #1376 | SLOT-24 + Pre-quant TTT | Yes | Yes |
+| 1.0791 | #1423 | SP8192, Pre-Quant TTT, QK-Gain 5.0, Depth Recurrence, MuonEq-R | Yes | No |
+| 1.0795 | #1416 | SP8192, Pre-Quant TTT on PR #1394 base | Yes | No |
+| 1.0800 | #1408 | dTTT 10ep, BigramHash 3072×112, GPTQ, XSA-all, QK-Gain 5.0 | Yes | No |
+| 1.0801 | #1420 | Triple Loop (17 virtual layers), Fused MLP Kernels, Parallel Residuals, N-gram Tilt | Yes | No |
+| 1.0856 | #1394 | SP8192, GPTQ Embeddings, Depth Recurrence, MuonEq-R, SDClip, Brotli. **No TTT** | No | No |
+| 1.0898 | #1399 | Pre-Quant TTT + ETLB (Eval-Time Logit Bias) | Yes | No |
+| 1.0913 | #1415 | SP4096, 3-Layer Recurrence, GPTQ Embeddings, SDClip, ETLB. No TTT | No | No |
+| 1.0925 | #1421 | Depth Recurrence + EMA Tuning (0.9965) | Yes | No |
+| 1.1020 | #1392 | SP4096, Depth Recurrence, Parallel Residuals, QK-Gain, Brotli. No TTT | No | No |
+| 1.1158 | #1410 | LatentMask TTT, GPTQ, Product-Key Bigram, Brotli | Yes | No |
+
+### NEW Techniques (high-signal, 2026-04-06)
+
+#### R1. Depth Recurrence — CRITICAL, NOW UNIVERSAL IN SUB-1.10
+
+Loop a subset of transformer layers multiple times, sharing parameters across iterations. Creates "virtual depth" from fewer physical parameters.
+
+**How it works** (from PR #1394, #1420):
+- Layers 4-5 are designated as the "recurrence core"
+- During forward pass, these layers are executed 2-3 times (NUM_LOOPS=2 or 3)
+- With 11 physical layers + NUM_LOOPS=2 on layers 4-5: encoder becomes `[0,1,2,3,4,5,4,5]`, decoder `[4,5,6,7,8,9,10]` = 15 virtual layers
+- With NUM_LOOPS=3 (PR #1420): `[0,1,2,3,4,5,4,5,4,5]` = 17 virtual layers
+- Activation threshold: enable looping after 35-50% of training (to allow warmup without recurrence)
+
+**Impact**: ~-0.015 BPB from depth recurrence alone.
+
+**Trade-off**: Each loop iteration costs throughput (~-200 steps in 600s per extra loop). Triple loop (17 virtual layers) is optimal; quadruple (19 virtual) loses too many steps.
+
+**Quantization interaction**: Shared weights are quantized once, but quantization error compounds through N repeats. Solutions: Noisy QAT (PR #363), GPTQ with careful calibration.
+
+**Evidence**: Universal in every no-TTT submission below 1.10 (PR #1394, #1392, #1415, #1420).
+
+#### R2. SP4096/SP8192 Tokenizers — HIGH
+
+Larger vocabularies than SP1024. Better per-byte compression = lower BPB at same perplexity.
+
+**SP4096**: Allows MLP 4x (wider MLPs). ~3.32 bytes/token avg. Used by PR #1392, #1415.
+**SP8192**: Even more tokens per byte. Used by PR #1394, #1416, #1423. Current no-TTT frontier (1.086).
+
+**BPB is tokenizer-agnostic**: Total byte count of validation set is identical regardless of tokenizer. More tokens (SP1024) or fewer tokens (SP4096/8192) — bytes sum is the same.
+
+**Trade-off**: Larger embedding table. SP8192 embedding is 8192×512 = 4M params. GPTQ on embeddings (int8) makes this fit.
+
+#### R3. Pre-Quant TTT — HIGH (for TTT lane)
+
+Adapt full-precision EMA model on validation data BEFORE GPTQ quantization. Adapted weights are baked into the artifact — zero eval-time overhead.
+
+**From PR #1416**: TTT gives -0.034 BPB on SP8192 base (post-EMA 1.1019 → post-TTT 1.0682 → post-GPTQ+sliding 1.0795).
+
+**Key details**:
+- 6 epochs AdamW on EMA model
+- Freeze first 2 blocks, adapt last 9
+- Cosine LR decay from 0.0005
+- Score-first compliant (each chunk scored before training)
+- Time: ~112s within 10min eval budget
+
+**vs traditional TTT**: Pre-quant TTT bakes adaptation into the model permanently. No eval-time adaptation needed. Cleaner separation.
+
+#### R4. SDClip (Standard Deviation Clip) — MEDIUM-HIGH
+
+Choose quantization clip threshold based on row standard deviation instead of percentile search.
+
+**From PR #1394**: Instead of trying 5 clip percentiles and picking lowest MSE, directly use `clip = K * std(row)` where K is tuned. Interacts better with compression because it produces a more predictable quantized value distribution.
+
+**Key insight from PR #1394**: "An int5 quantized network can actually compress smaller than an int4 one if the int5 quantization uses a much wider clip range." The effectiveness of brotli depends on entropy of quantized values, and SDClip optimizes this entropy.
+
+#### R5. GPTQ on Embeddings — MEDIUM
+
+Apply GPTQ (int8) to the embedding matrix too, not just weight matrices. Frees ~0.5-1MB of artifact space.
+
+**From PR #1394**: Standard approach keeps embeddings in fp16. GPTQ int8 on embeddings saves space with minimal quality loss because embeddings are already low-rank.
+
+#### R6. MuonEq-R (Row-Normalized Muon) — MEDIUM
+
+From PR #1217/@bigbag. Row normalization in Muon optimizer. Different from the original NorMuon — applies normalization to equalize row norms of the update.
+
+**Evidence**: Used in PR #1394 (1.086), #1415 (1.091), #1423 (1.079). Universal in current top stack.
+
+#### R7. QK-Gain 5.0 — LOW-MEDIUM
+
+Increase q_gain initialization from default (varies) to 5.0. One env var change.
+
+**From PR #1217**: Validated by @bigbag. +0.0004 BPB improvement (PR #1423 over #1416).
+
+**Evidence**: Used in PR #1413, #1415, #1420, #1423.
+
+#### R8. Parallel Residuals — MEDIUM
+
+GPT-J style: attention and MLP both read from the same pre-residual input, outputs summed in parallel.
+
+**From PR #1420**: Faster forward pass (+68 training steps). Also helps quantization (less interference between attention and MLP during GPTQ calibration).
+
+**Applied to deep layers only** (layers 7-10 in PR #1420).
+
+#### R9. Brotli Compression — LOW-MEDIUM
+
+Replacing lzma/zstd. Better compression ratio on quantized weight data in some configurations.
+
+**From PR #1392, #1394, #1410**: `brotli` level 11 used by several top submissions.
+
+#### R10. ETLB (Eval-Time Logit Bias) — LOW
+
+Optimize a bias vector `b ∈ R^vocab` added to output logits during sliding window evaluation. ~-0.002 BPB.
+
+**From PR #1399**: Document-level token frequency patterns. Zero-overhead at training time.
+
+#### R11. Fused MLP Kernels — LOW (high complexity)
+
+Triton TMA forward + CUTLASS EVT backward. ~10% throughput gain → +127 training steps.
+
+**From PR #1420**: Fuses `leaky_relu(fc(x), 0.5).square()` into single Triton kernel, eliminates 403MB intermediate from HBM. Backward fuses `(grad_out @ proj.weight) * act_grad` into CUTLASS epilogue.
+
+**Verdict**: High engineering effort. Only worthwhile at the very top of the leaderboard.
+
+#### R12. Product-Key Bigram — LOW-MEDIUM
+
+Factored `embed_prev(1024,512) * embed_cur(1024,512)` — zero hash collisions, no projection layer.
+
+**From PR #1410**: Cleaner than hash-based BigramHash. More parameter-efficient.
+
+#### R13. SLOT (Sparse Latent Optimization at Test-time) — SEPARATE TRACK
+
+Per-sample delta + logit bias, 24 AdamW steps per sample during eval. Gets 0.7094 BPB.
+
+**From PR #1376**: Per-sample `delta [bsz,1,512]` + `logit_bias [bsz,1,1024]`, 24 AdamW steps, stride=96.
+
+**Verdict**: Fundamentally different approach. Massive improvement but requires significant eval-time compute. Competition may split into SLOT vs non-SLOT tracks.
+
+### REVISED Leaderboard Targets (2026-04-06)
+
+```
+Our current:        1.1631
+
+Merged SOTA:        1.1147  (PR #1019)
+Open no-TTT:        1.0856  (PR #1394)
+Open with TTT:      1.0795  (PR #1416)
+Open with SLOT:     0.7094  (PR #1376)
+
+Gap to merged SOTA: 0.048
+Gap to no-TTT:      0.078
+```
+
+### REVISED Priority Stack (2026-04-06)
+
+The current winning no-TTT stack (PR #1394, 1.086) looks like:
+```
+SP8192 vocab (not SP1024!)
+11L, 512d, 8H/4KV, MLP 4x
+Depth Recurrence (loop layers 4-5 twice → 15 virtual layers)
+MuonEq-R (row-normalized Muon)
+LeakyReLU(0.5)²
+XSA on all 11 layers
+BigramHash 3072×112
+QK-Gain 5.0
+EMA(0.997)
+Sigmoid-gated U-Net skips
+SDClip quantization
+GPTQ on embeddings (int8)
+Full Hessian GPTQ int6 (AR self-gen calibration)
+Brotli compression
+Sliding eval stride=64
+```
+
+With Pre-Quant TTT added (PR #1416): 1.086 → 1.080.
+
+### What We Must Do
+
+1. **Adopt PR #1394 as template** — not PR #414 (which is now 2 generations behind).
+2. **Depth Recurrence is the biggest unlock we're missing** — loop layers 4-5, giving 15 virtual layers from 11 physical.
+3. **SP4096 or SP8192 tokenizer** — SP1024 is no longer competitive. This is a fundamental limitation.
+4. **SDClip replaces percentile-based quantization** — better compression-aware clipping.
+5. **GPTQ on embeddings** — free space savings.
+6. **MuonEq-R** — replaces plain Muon.
+7. **Pre-Quant TTT** (if pursuing TTT lane) — bakes adaptation into artifact.
+
+### Key Strategic Shift
+
+The competition has moved into a fundamentally different regime:
+- **Tokenizer matters now**: SP8192 > SP4096 > SP1024. Our SP1024 baseline is ~0.02-0.03 BPB behind just from tokenizer choice.
+- **Virtual depth via recurrence**: 15-17 virtual layers from 11 physical. This is ~-0.015 BPB.
+- **Compression-aware quantization**: SDClip + Brotli > percentile + zstd/lzma.
+- **GPTQ everywhere**: Not just weights — embeddings too.
+- **Pre-Quant TTT**: The cleanest form of TTT — baked into artifact, no eval-time overhead.
