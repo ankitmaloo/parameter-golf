@@ -349,3 +349,138 @@ Hinv = torch.linalg.cholesky(Hinv, upper=True)
 ```
 
 **Quantization gap**: Pre-quant 1.1354 → Post-GPTQ 1.1377 (+0.0023) → Sliding window **1.1147** (sliding window recovers -0.023 BPB)
+
+---
+
+## UPDATE 2026-04-09 — New Frontier PRs
+
+### Leaderboard Snapshot
+
+| Tier | PR | BPB | Author | Key Stack | TTT | SLOT |
+|------|----|-----|--------|-----------|-----|------|
+| **S** | #1507 | **0.2282** | ChideraIbe123 | L-BFGS SLOT + Entropy-Adaptive N-gram Mixer (order-12) | No | Yes |
+| **S** | #1488 | **0.8265** | ndokutovich | SP1024 + SLOT-24 + QK5.25 + Pre-Quant TTT 10ep | Yes | Yes |
+| **A** | #1487 | **1.0600** | ndokutovich | SP8192 + Recur345 + Par7 + EMA + QK5.25 + Pre-Quant TTT 10ep | Yes | No |
+| **A** | #1485 | **1.0679** | ndokutovich | SP8192 + Recur345 + Par7 + EMA + QK5.0 + Pre-Quant TTT 6ep | Yes | No |
+| **A** | #1489 | **1.0736** | joshkmartinez | SP1024 + MLP4x + Looping 4-5 + Par7 + Pre-Quant TTT + ETLB | Yes | No |
+| **A** | #1482 | **1.0787** | aamodbhatt | SP8192 + Recur + QK5.25 + Pre-Quant TTT 8ep freeze-1 | Yes | No |
+| **A** | #1493 | **1.0810** | bigbag | SP8192 + Recur345 + Par7 + QK5.25 + Legal Score-First TTT | Yes | No |
+| **A** | #1477 | **1.0822** | aryanbhosale | SP8192 + Par7 + Score-First TTT 3ep | Yes | No |
+| **A** | #1460 | **1.0827** | resouer | SP8192 + Score-First TTT + Eval-Time Hash Embedding | Yes | No |
+| **A** | #1450 | **1.0848** | andrewbaggio1 | TMA Megakernel + Triple Loop + Par7 (no TTT) | No | No |
+| **A** | #1471 | **1.0866** | X-Abhishek-X | SP8192 + SDClip + Recur345 + EMA 0.9965 (no TTT) | No | No |
+| **B** | #1458 | **1.1060** | newjordan | 12L + Mixed int5/6 + Brotli (no TTT, pure neural) | No | No |
+| **B** | #1508 | **1.1135** | jpfeiffe | SP4096 + Compressibility Regularization + Brotli | No | No |
+| Merged | #1019 | 1.1147 | abaybektursun | AR Self-Gen GPTQ + XSA-all + BH3072 | No | No |
+
+### New Techniques Since Last Update
+
+#### N1: L-BFGS SLOT (PR #1507, 0.2282 BPB)
+Replaces AdamW with L-BFGS for the SLOT optimization (per-window delta + logit_bias). L-BFGS uses curvature information via gradient history — 6 outer steps with strong Wolfe line search + history_size=10. Second-order methods converge in O(n) steps for the 1,536-parameter SLOT problem. Combined with **entropy-adaptive order-12 n-gram mixer** (4M hash buckets, backoff). Mixing alpha depends on neural model entropy, match order, and context count — all target-independent. Scaling: AdamW SLOT 0.8637 → L-BFGS SLOT 0.5793 → + n-gram 0.2968 → + order/count features **0.2282**.
+
+#### N2: Pre-Quant TTT Tuning (PR #1487, 1.0600 — current overall no-SLOT frontier)
+Same code as PR #1485 but tuned env vars: QK_GAIN_INIT 5.0→**5.25**, TTT_EPOCHS 6→**10**, TTT_FREEZE_BLOCKS 2→**1** (freeze fewer = adapt more), TTT_LR 0.0005→**0.00045**. Delta: -0.0079 BPB from hyperparameter tuning alone. Shows the TTT response surface is steep — small changes in epochs/LR/freeze matter.
+
+#### N3: SP1024 + Pre-Quant TTT + MLP 4x (PR #1489, 1.0736)
+Surprises: achieves 1.0736 with SP1024 (not SP8192). Key insight: smaller vocab frees ~4M params for wider transformer (MLP 4x instead of 3x). Pre-quant TTT is the workhorse (-0.034 BPB). Uses ETLB at eval time. Looping on layers 4-5 only (2 loops, not 3). Shows SP1024 is not dead — it's a different tradeoff.
+
+#### N4: SLOT + Pre-Quant TTT combo (PR #1488, 0.8265)
+First combination of pre-quant TTT (weight-level adaptation, baked into artifact) with SLOT (hidden-state optimization, eval-time). They're complementary: TTT improves the base sliding score from ~1.12 to 1.088, then SLOT pushes from that better base to 0.8265. Delta vs prior SLOT SOTA: -0.037 BPB.
+
+#### N5: Eval-Time Hash Embedding (PR #1460, 1.0827)
+Novel: zero-initialized `nn.Embedding(16384, 512)` created at eval time, trained through the score-first TTT loop. Bigram hash `h = (prev * 2039 + curr) % 16384` looks up residual vector added to tok_emb(x) before RMSNorm. The hash embedding learns document-local bigram patterns. Measured delta: -0.0004 BPB (small but legal and free).
+
+#### N6: TMA Megakernel (PR #1450, 1.0848)
+Triton TMA fused MLP forward: fuses `fc → leaky_relu(0.5) → square` into a single Hopper TMA kernel. Uses TensorDescriptor for async global-to-shared transfers, persistent scheduling (one program per SM), 128×256×64 block tiling. Avoids materializing ~384MB intermediate per forward pass. +10.5% throughput → +127 extra steps in 600s. Triple loop (NUM_LOOPS=3, 17 virtual layers). No TTT — pure training quality.
+
+#### N7: 12 Layers via Mixed Quantization (PR #1458, 1.1060)
+Fits 12 layers (up from 11) by using mixed-int quantization (attn=int5, mlp=int6, aux=int6, embed=int8) + Brotli. Pure neural submission: no TTT, no SLOT, no eval tricks. Shows that squeezing in an extra layer is worth ~0.01 BPB.
+
+#### N8: Compressibility Regularization (PR #1508, 1.1135)
+SP4096 + ramped weight decay during warmdown (WARMDOWN_WD_MULT=2.0). The idea: increasing WD in warmdown pushes weights toward zero, improving compressibility. Combined with brotli-11 (selected when smaller than lzma). Result: zero pruning needed across all 6 seeds. Small but statistically significant delta vs merged SOTA: -0.00125 BPB.
+
+#### N9: 3-Layer Recurrence is Now Standard
+Layers 3,4,5 looped → 14 virtual layers from 11 physical. Present in PRs #1471, #1477, #1482, #1485, #1487, #1493. Activation at step 2000 (or frac 0.35). This is no longer novel — it's table stakes for the frontier.
+
+### Revised Priority Stack (as of 2026-04-09)
+
+The no-SLOT, no-TTT frontier is **1.0848** (PR #1450, TMA Megakernel). The no-SLOT, with-TTT frontier is **1.0600** (PR #1487). The SLOT frontier is **0.2282** (PR #1507).
+
+**Tier 0 — Table stakes (all frontier PRs have these)**:
+- SP8192 tokenizer
+- 11 layers, 512d, 8/4 GQA, MLP 3x (or 4x with SP1024)
+- 3-layer depth recurrence (L3-5)
+- Parallel residuals from layer 7
+- XSA all layers
+- LeakyReLU(0.5)²
+- QK-Gain 5.0-5.25
+- EMA 0.9965
+- Full Hessian GPTQ int6 + SDClip + brotli
+- Sliding window eval (stride=64)
+- Skip gates, SmearGate, partial RoPE 16/64, LN Scale
+
+**Tier 1 — Pre-Quant TTT (worth -0.02 to -0.034 BPB)**:
+- AdamW on val data, 6-10 epochs, lr=0.00045, freeze 1-2 blocks, cosine decay
+- Applied after EMA, before GPTQ
+- Baked into artifact — deterministic at eval time
+- Tuning matters: epochs 6→10 and freeze 2→1 gave -0.008 BPB
+
+**Tier 2 — Engineering throughput**:
+- TMA Megakernel fused MLP (+10.5% throughput, +127 steps)
+- Triple loop (NUM_LOOPS=3, 17 virtual from 11)
+- These give ~-0.005 BPB from more steps at same quality
+
+**Tier 3 — Eval-time adaptation (if rules allow)**:
+- Score-First TTT (SGD, 3-5 epochs per chunk): -0.002 to -0.005 BPB
+- ETLB (eval-time logit bias): -0.001 BPB
+- Eval-Time Hash Embedding: -0.0004 BPB
+- SLOT (L-BFGS, 6 steps): -0.25+ BPB (game-changer but different paradigm)
+- N-gram mixer (order-12, entropy-adaptive): -0.35 BPB on top of SLOT
+
+**Tier 4 — Minor but free**:
+- QK-Gain 5.0→5.25: -0.0004 BPB
+- Compressibility regularization (WARMDOWN_WD_MULT=2.0): -0.001 BPB
+- Brotli vs LZMA: depends on checkpoint, pick whichever is smaller
+- 12 layers via mixed int5/int6: -0.01 BPB (if it fits)
+
+### Key Observations
+
+1. **ndokutovich is running the table.** PRs #1485, #1487, #1488 — three submissions in rapid succession, each strictly better than the last. The jump from 1.0679 to 1.0600 was pure hyperparameter tuning (TTT epochs, LR, freeze depth). This player understands the response surface.
+
+2. **Pre-quant TTT is the biggest single technique.** -0.034 BPB standalone. Every sub-1.08 submission uses it. The tuning matters more than people realize: freeze 1 vs 2 blocks, 6 vs 10 epochs, lr 0.0005 vs 0.00045.
+
+3. **SP1024 is not dead.** PR #1489 achieves 1.0736 with SP1024 by going MLP 4x. The freed embedding params pay for a wider model. This is an alternative lane if SP8192 data prep is a bottleneck.
+
+4. **The SLOT paradigm has separated from everything else.** 0.2282 BPB with L-BFGS SLOT + n-gram is a completely different game. The competition may need to split tracks. The n-gram mixer alone (without SLOT) would be interesting to test on the standard stack.
+
+5. **TMA megakernels are pure engineering alpha.** +10.5% throughput is real. But writing Triton TMA kernels is hard. The payoff is ~-0.005 BPB from extra steps.
+
+6. **3-layer recurrence + parallel residuals are now universal.** Every frontier PR uses them. Not debatable anymore.
+
+### Updated Lineage Tree
+
+```
+Merged SOTA:
+  PR #1019 (1.1147) — AR Self-Gen GPTQ, XSA-all, BH3072
+
+No-TTT frontier:
+  PR #1394 (1.0856) — SP8192, SDClip, Recur, MuonEq-R
+    └→ PR #1471 (1.0866) — + 3-layer recur (L345), EMA 0.9965
+       └→ PR #1450 (1.0848) — + TMA Megakernel, triple loop, +127 steps
+
+TTT frontier:
+  PR #1394 base
+    └→ PR #1471/1445 tuned hyperparams (WD=0.095, MLR=0.022, warmdown=0.72)
+       └→ PR #1482 (1.0787) — + Pre-Quant TTT 8ep, QK5.25, freeze-1
+          └→ PR #1485 (1.0679) — + 3-layer recur + par7 + full stack TTT 6ep
+             └→ PR #1487 (1.0600) — + TTT tuning: 10ep, lr=0.00045, freeze-1 ← FRONTIER
+
+SP1024 lane:
+  PR #1019 base
+    └→ PR #1489 (1.0736) — SP1024, MLP 4x, loop 4-5, par7, pre-quant TTT, ETLB
+
+SLOT frontier:
+  PR #1313 (0.8637) — AdamW SLOT-24
+    └→ PR #1488 (0.8265) — + Pre-Quant TTT + QK5.25
+    └→ PR #1507 (0.2282) — L-BFGS SLOT + entropy-adaptive n-gram mixer ← OVERALL BEST
+```

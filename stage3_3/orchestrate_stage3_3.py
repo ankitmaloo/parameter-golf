@@ -1,10 +1,8 @@
 #!/usr/bin/env python3
-"""Stage 3.3 orchestrator: state-dependent hyperparameter screens.
+"""Stage 3.3 orchestrator: architecture and training pushes on Era 6 stack.
 
-Extends stage3 orchestrator with:
-- Base script is base_train_gpt.py (1.1233 frontier code) in this directory
-- Patches from stage3_3/patches.py
-- All Lane A (training) — no export-only mode needed
+Lane A (training): deeper recurrence, wider models, training signal
+improvements.  Data paths derived from config defaults (SP8192).
 """
 from __future__ import annotations
 
@@ -50,13 +48,12 @@ class JobSpec:
 # ---------------------------------------------------------------------------
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Stage 3.3 state-dependent hyperparameter screen orchestrator.")
+    parser = argparse.ArgumentParser(description="Stage 3.3 architecture & training push orchestrator (Era 6).")
     parser.add_argument("--config", default=None, help="Path to run_configs.json.")
     parser.add_argument(
         "--phase",
         default="plan",
-        choices=["plan", "sanity", "screen", "lane_b_bakeoff", "composite", "decision",
-                 "final_single", "champion_8x", "all"],
+        choices=["plan", "screen", "decision", "all"],
     )
     parser.add_argument("--label", default=datetime.now().strftime("%Y%m%d_%H%M%S"))
     parser.add_argument("--gpus", default="0,1,2,3,4,5,6,7")
@@ -186,9 +183,9 @@ def build_job(
     # Resolve data paths relative to the parameter-golf root
     pgolf_root = stage_dir.parent
     if env.get("DATA_PATH", "").startswith("./"):
-        env["DATA_PATH"] = str((pgolf_root / "data" / "datasets" / "fineweb10B_sp1024").resolve())
+        env["DATA_PATH"] = str((pgolf_root / env["DATA_PATH"].lstrip("./")).resolve())
     if env.get("TOKENIZER_PATH", "").startswith("./"):
-        env["TOKENIZER_PATH"] = str((pgolf_root / "data" / "tokenizers" / "fineweb_1024_bpe.model").resolve())
+        env["TOKENIZER_PATH"] = str((pgolf_root / env["TOKENIZER_PATH"].lstrip("./")).resolve())
     if gpu_spec is not None:
         env["CUDA_VISIBLE_DEVICES"] = gpu_spec
 
@@ -281,8 +278,16 @@ def parse_metrics(log_path: Path) -> dict[str, Any]:
         "step_avg_ms": parse_float(r"step_avg:([0-9.]+)ms", text),
         "pre_quant_bpb": pre_quant_bpb,
         "post_quant_bpb": post_quant_bpb,
-        "submission_size_bytes": parse_int(r"Total submission size int[68]\+(?:zstd|zlib): (\d+) bytes", text),
+        "submission_size_bytes": parse_int(r"Total submission size int[68]\+(?:zstd|zlib|brotli): (\d+) bytes", text),
     }
+
+
+def fmt_metric(value: Any) -> str:
+    if value is None:
+        return "?"
+    if isinstance(value, float):
+        return f"{value:.6f}"
+    return str(value)
 
 
 # ---------------------------------------------------------------------------
@@ -323,7 +328,7 @@ def comparison_entry(
         "delta_quant_gap": delta(quant_gap(candidate), quant_gap(control)),
         "delta_step_avg_ms": delta(candidate.get("step_avg_ms"), control.get("step_avg_ms")),
         "delta_steps": delta_int(candidate.get("steps"), control.get("steps")),
-        "candidate_post_quant_gap_to_sota": delta(candidate.get("post_quant_bpb"), benchmarks["record_sota_bpb"]),
+        "candidate_post_quant_gap_to_sota": delta(candidate.get("post_quant_bpb"), benchmarks.get("merged_sota_bpb", benchmarks.get("record_sota_bpb"))),
     }
 
 
@@ -411,10 +416,10 @@ def write_phase_summary(
     print(f"{'='*60}", flush=True)
     for r_id, r_metrics in sorted(phase_results.items()):
         lane = slot_map.get(r_id, {}).get("lane", "?")
-        print(f"  {r_id:12s} [{lane}]  post_quant={r_metrics.get('post_quant_bpb', '?'):>8s}  "
-              f"pre_quant={r_metrics.get('pre_quant_bpb', '?'):>8s}  "
-              f"steps={r_metrics.get('steps', '?')}  "
-              f"ms/step={r_metrics.get('step_avg_ms', '?')}  "
+        print(f"  {r_id:12s} [{lane}]  post_quant={fmt_metric(r_metrics.get('post_quant_bpb')):>10s}  "
+              f"pre_quant={fmt_metric(r_metrics.get('pre_quant_bpb')):>10s}  "
+              f"steps={fmt_metric(r_metrics.get('steps'))}  "
+              f"ms/step={fmt_metric(r_metrics.get('step_avg_ms'))}  "
               f"rc={r_metrics.get('returncode', '?')}", flush=True)
     if comparisons:
         # Show rankings per lane
@@ -555,8 +560,8 @@ def run_serial_phase(
 
 
 _HYPOTHESIS_BAR_FIELDS = [
-    "broken_invariant", "mechanism", "dominant_metric", "expected_impact",
-    "expected_horizon", "early_signal", "failure_mode", "kill_rule", "code_burden",
+    "mechanism", "math", "placement", "coefficients",
+    "failure_modes", "kill_rule", "dominant_metric", "expected_impact",
 ]
 
 
@@ -605,8 +610,8 @@ def main() -> None:
         print(json.dumps(config, indent=2))
         return
 
-    if args.phase in {"sanity", "screen", "composite"}:
-        phase = phase_from_config(config, args.phase)
+    if args.phase == "screen":
+        phase = phase_from_config(config, "screen")
         slot_ids = resolve_phase_slots(args, phase)
         ensure_ready(slot_ids, slot_map)
         results = run_parallel_phase(script_path, config_path, config, phase, args.label, slot_ids, gpus, args.dry_run)
@@ -615,109 +620,39 @@ def main() -> None:
             print(f"[summary] {sp}", flush=True)
         return
 
-    if args.phase == "lane_b_bakeoff":
-        phase = phase_from_config(config, "lane_b_bakeoff")
-        slot_ids = resolve_phase_slots(args, phase)
+    if args.phase == "decision":
+        phase = phase_from_config(config, "decision")
+        slot_ids = resolve_final_slots(args, run_root, args.top_k)
         ensure_ready(slot_ids, slot_map)
-        # Resolve checkpoint: use control run's final_model.pt from screen phase
-        ckpt_source = config["phases"]["lane_b_bakeoff"].get("checkpoint_source", "R0A")
-        ckpt_path = _resolve_checkpoint(run_root, ckpt_source, slot_map)
-        if ckpt_path is None and not args.dry_run:
-            raise SystemExit(
-                f"No checkpoint found for lane_b_bakeoff. Run screen phase first, "
-                f"or set checkpoint_source in config. Looked for control '{ckpt_source}' "
-                f"in {run_root}"
-            )
-        results = run_parallel_phase(
-            script_path, config_path, config, phase, args.label, slot_ids, gpus, args.dry_run,
-            checkpoint_path=str(ckpt_path) if ckpt_path else None,
-        )
-        if not args.dry_run:
-            sp = write_phase_summary(run_root, phase.name, results, slot_map, config["benchmarks"], args.top_k)
-            print(f"[summary] {sp}", flush=True)
-        return
-
-    if args.phase in {"decision", "final_single", "champion_8x"}:
-        phase = phase_from_config(config, args.phase)
-        if args.phase in {"decision", "final_single"}:
-            slot_ids = resolve_final_slots(args, run_root, args.top_k)
-            ensure_ready(slot_ids, slot_map)
-            results = run_partitioned_phase(script_path, config_path, config, phase, args.label, slot_ids, gpus, args.dry_run)
-        else:
-            slot_ids = args.final_slots or args.slots
-            if not slot_ids:
-                slot_ids = resolve_final_slots(args, run_root, 1)
-            ensure_ready(slot_ids, slot_map)
-            results = run_serial_phase(script_path, config_path, config, phase, args.label, slot_ids,
-                                       ",".join(gpus[:phase.nproc_per_slot]), args.dry_run)
+        results = run_partitioned_phase(script_path, config_path, config, phase, args.label, slot_ids, gpus, args.dry_run)
         if not args.dry_run:
             sp = write_phase_summary(run_root, phase.name, results, slot_map, config["benchmarks"], args.top_k)
             print(f"[summary] {sp}", flush=True)
         return
 
     if args.phase == "all":
-        # Full stage order: sanity → screen → lane_b_bakeoff → composite → decision → champion_8x
-        sanity = phase_from_config(config, "sanity")
+        # Full stage order: screen → decision
         screen = phase_from_config(config, "screen")
-        sanity_slots = resolve_phase_slots(args, sanity)
         screen_slots = resolve_phase_slots(args, screen)
-        ensure_ready(sanity_slots, slot_map)
         ensure_ready(screen_slots, slot_map)
 
         if args.dry_run:
             print("[dry-run] Full stage order:", flush=True)
-            for pname in ["sanity", "screen", "lane_b_bakeoff", "composite", "decision", "champion_8x"]:
-                pspec = phase_from_config(config, pname)
-                pslots = pspec.slots or ["(from promotion)"]
-                print(f"  {pname}: slots={pslots} wallclock={pspec.max_wallclock_seconds}s", flush=True)
-            run_parallel_phase(script_path, config_path, config, sanity, args.label, sanity_slots, gpus, True)
+            for pname in ["screen", "decision"]:
+                if pname in config["phases"]:
+                    pspec = phase_from_config(config, pname)
+                    pslots = pspec.slots or ["(from promotion)"]
+                    print(f"  {pname}: slots={pslots} wallclock={pspec.max_wallclock_seconds}s", flush=True)
+            run_parallel_phase(script_path, config_path, config, screen, args.label, screen_slots, gpus, True)
             return
 
-        # 1. Sanity
-        print(f"\n{'='*60}\n  STAGE: sanity\n{'='*60}", flush=True)
-        sanity_results = run_parallel_phase(script_path, config_path, config, sanity, args.label, sanity_slots, gpus, False)
-        write_phase_summary(run_root, sanity.name, sanity_results, slot_map, config["benchmarks"], args.top_k)
-        if any(r.get("returncode") not in (0, None) for r in sanity_results.values()):
-            raise SystemExit("Sanity phase had failures. Refusing to continue.")
-
-        # 2. Screen
+        # 1. Screen (1-GPU parallel training runs)
         print(f"\n{'='*60}\n  STAGE: screen\n{'='*60}", flush=True)
         screen_results = run_parallel_phase(script_path, config_path, config, screen, args.label, screen_slots, gpus, False)
         sp = write_phase_summary(run_root, screen.name, screen_results, slot_map, config["benchmarks"], args.top_k)
         print(f"[summary] {sp}", flush=True)
 
-        # 3. Lane B bakeoff (export-only on control checkpoint)
-        lane_b = phase_from_config(config, "lane_b_bakeoff")
-        lane_b_slots = resolve_phase_slots(args, lane_b)
-        lane_b_ready = [s for s in lane_b_slots if slot_map[s]["implementation_state"] == "ready"]
-        if lane_b_ready:
-            print(f"\n{'='*60}\n  STAGE: lane_b_bakeoff\n{'='*60}", flush=True)
-            ckpt_source = config["phases"]["lane_b_bakeoff"].get("checkpoint_source", "R0A")
-            ckpt_path = _resolve_checkpoint(run_root, ckpt_source, slot_map)
-            if ckpt_path is None:
-                print(f"[warn] No checkpoint found for lane_b_bakeoff (source={ckpt_source}). Skipping.", flush=True)
-            else:
-                lane_b_results = run_parallel_phase(
-                    script_path, config_path, config, lane_b, args.label, lane_b_ready, gpus, False,
-                    checkpoint_path=str(ckpt_path),
-                )
-                sp = write_phase_summary(run_root, lane_b.name, lane_b_results, slot_map, config["benchmarks"], args.top_k)
-                print(f"[summary] {sp}", flush=True)
-
-        # 4. Composite (if declared with slots)
-        composite = phase_from_config(config, "composite")
-        composite_slots = composite.slots
-        if composite_slots:
-            composite_ready = [s for s in composite_slots if slot_map[s]["implementation_state"] == "ready"]
-            if composite_ready:
-                print(f"\n{'='*60}\n  STAGE: composite\n{'='*60}", flush=True)
-                composite_results = run_parallel_phase(
-                    script_path, config_path, config, composite, args.label, composite_ready, gpus, False,
-                )
-                sp = write_phase_summary(run_root, composite.name, composite_results, slot_map, config["benchmarks"], args.top_k)
-                print(f"[summary] {sp}", flush=True)
-
-        # 5. Decision (promoted finalists, full-length)
+        # 2. Decision (promoted finalists, full-box 8xH100)
         print(f"\n{'='*60}\n  STAGE: decision\n{'='*60}", flush=True)
         decision_phase = phase_from_config(config, "decision")
         final_slots = resolve_final_slots(args, run_root, args.top_k)
@@ -726,17 +661,6 @@ def main() -> None:
         decision_results = run_partitioned_phase(script_path, config_path, config, decision_phase, args.label, final_slots, gpus, False)
         sp = write_phase_summary(run_root, decision_phase.name, decision_results, slot_map, config["benchmarks"], args.top_k)
         print(f"[summary] {sp}", flush=True)
-
-        # 6. Champion 8x
-        if should_run_champion(args):
-            print(f"\n{'='*60}\n  STAGE: champion_8x\n{'='*60}", flush=True)
-            champ_phase = phase_from_config(config, "champion_8x")
-            champ_slot = final_slots[:1]
-            print(f"[promote] champion_8x slot={champ_slot[0]}", flush=True)
-            champ_results = run_serial_phase(script_path, config_path, config, champ_phase, args.label, champ_slot,
-                                              ",".join(gpus[:champ_phase.nproc_per_slot]), False)
-            sp = write_phase_summary(run_root, champ_phase.name, champ_results, slot_map, config["benchmarks"], 1)
-            print(f"[summary] {sp}", flush=True)
         return
 
     raise SystemExit(f"Unsupported phase: {args.phase}")

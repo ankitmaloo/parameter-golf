@@ -94,7 +94,39 @@ They are dynamic policy families over the bounded controller DSL.
 - Failure mode:
   - system-aware throttling removes the very mechanism that would have paid off later
 
-## H207 Context Budget Controller
+## H207 Best-State + Narrow Pre-Quant TTT
+
+- Mechanism:
+  - choose the best late deployed state
+  - then run pre-quant TTT only on the last 2 blocks
+- Why:
+  - the best TTT starting point likely matters, and narrow last-block adaptation is one real frontier recipe
+- Dominant lane:
+  - deploy / TTT
+- Expected impact:
+  - medium
+- Earliest signal:
+  - `600s`
+- Failure mode:
+  - TTT mostly washes away checkpoint choice or last-2-only adaptation is too weak
+
+## H208 Best-State + Broader dTTT Tail
+
+- Mechanism:
+  - choose the best late deployed state
+  - then run a broader TTT finisher with block-wise LR decay over most of the upper trunk
+- Why:
+  - the frontier is no longer just “do TTT”; it is “which TTT law wins”
+- Dominant lane:
+  - deploy / TTT
+- Expected impact:
+  - medium to large
+- Earliest signal:
+  - `600s`
+- Failure mode:
+  - broader adaptation overfits, is too expensive, or does not beat the simpler narrow finisher
+
+## H209 Context Budget Controller
 
 - Mechanism:
   - switch between cheaper and richer context modes by training state
@@ -109,7 +141,7 @@ They are dynamic policy families over the bounded controller DSL.
 - Failure mode:
   - switching context modes introduces instability or wastes specialization
 
-## H208 Composite Late Policy
+## H210 Composite Late Policy
 
 - Mechanism:
   - jointly control:
@@ -135,5 +167,7 @@ The strongest first-wave families are:
 2. `H202 Best-State Controller`
 3. `H205 Alternating Objective Controller`
 4. `H204 Family-Split Warmdown`
+5. `H207 Best-State + Narrow Pre-Quant TTT`
+6. `H208 Best-State + Broader dTTT Tail`
 
 These should be the center of `stage3_2`.

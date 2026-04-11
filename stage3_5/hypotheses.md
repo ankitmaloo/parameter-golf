@@ -1,53 +1,54 @@
 # Stage 3.5 Hypotheses
 
-These are not controller hypotheses and not fixed-time branch hypotheses.
+These are event-triggered late-program tournament hypotheses on the active executable
+strong local base. They are not controller policies and not fixed-time branch
+hypotheses.
 
-They are event-triggered branch tournament hypotheses.
-
-## H501 Adaptive Tri Portfolio
+## H501 Pre-Quant TTT Tri Portfolio
 
 - Mechanism:
   - branch on late training state
-  - three finisher programs
-  - raw vs EMA export portfolio inside each branch
+  - run three different pre-quant TTT finishers
+  - choose the best export mode inside each branch
 - Why:
-  - late uncertainty is about both branch timing and export state
+  - late uncertainty is mainly in the TTT law and export object, not just branch timing
 
-## H502 Scale-Gated Dual Deep
+## H502 TTT Breadth-vs-Depth Duel
 
 - Mechanism:
-  - branch only when LR scale gets low enough
-  - two deeper finishers instead of three shallower finishers
+  - trigger only when the late scale condition is met
+  - compare two deeper TTT programs instead of a broader tri-set
 - Why:
-  - branch depth may matter more than branch breadth
+  - branch depth may matter more than branch breadth once the branch family is TTT-focused
 
-## H503 Plateau-Gated Aggressive
+## H503 Plateau-Gated Aggressive Swing
 
 - Mechanism:
-  - branch when training plateaus or hits a failsafe time
-  - aggressive QAT and matrix-push finishers compete against EMA
+  - branch on plateau or a hard late failsafe
+  - let aggressive dTTT-style and recurrent-deploy finishers compete against a conservative TTT fallback
 - Why:
-  - branching should let us try harder late swings because bad branches can be discarded
+  - branching should buy permission to swing harder late because failed branches can be discarded
 
-## H504 State-Style Tournament
+## H504 Export-State Style Tournament
 
 - Mechanism:
-  - raw-finish, EMA-heavy, and deploy-QAT compete as export-state styles
+  - keep the late TTT program simple
+  - compete over raw-state, EMA-state, and broader freeze-2 state styles
 - Why:
-  - the dominant late uncertainty may be the export object, not the optimizer path
+  - the dominant late uncertainty may be the starting/export object rather than the finisher law itself
 
-## H505 Family-vs-Deploy Event Duel
+## H505 TTT-vs-Recurrent Deploy Duel
 
 - Mechanism:
-  - no trivial EMA branch
-  - deploy-QAT competes directly against family/matrix late specialization
+  - no trivial EMA fallback
+  - dTTT-style tail adaptation competes directly against recurrent deploy shaping
 - Why:
-  - if branching is real, nontrivial late mechanisms should be able to duel directly
+  - if branching is real, two nontrivial late mechanisms should be able to duel directly
 
 ## H506 Failsafe Event Tri
 
 - Mechanism:
   - adaptive trigger with a hard max-frac failsafe
-  - three non-identical finisher programs
+  - three TTT/deploy programs always get a guaranteed late tournament window
 - Why:
-  - robust branching may need both adaptation and a guaranteed late branch point
+  - robust branching may need both adaptivity and a guaranteed branch point

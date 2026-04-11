@@ -269,9 +269,9 @@ def build_job(
     env["PGOLF_HAILMARY_RUNNER_MODE"] = slot.get("runner_mode", "train")
     env["PYTHONUNBUFFERED"] = "1"
     if env["DATA_PATH"].startswith("./"):
-        env["DATA_PATH"] = str((pgolf_root / "data" / "datasets" / "fineweb10B_sp1024").resolve())
+        env["DATA_PATH"] = str((pgolf_root / env["DATA_PATH"][2:]).resolve())
     if env["TOKENIZER_PATH"].startswith("./"):
-        env["TOKENIZER_PATH"] = str((pgolf_root / "data" / "tokenizers" / "fineweb_1024_bpe.model").resolve())
+        env["TOKENIZER_PATH"] = str((pgolf_root / env["TOKENIZER_PATH"][2:]).resolve())
     if gpu_spec is not None:
         env["CUDA_VISIBLE_DEVICES"] = gpu_spec
 
@@ -1015,48 +1015,55 @@ def build_tournament_finalist_pack(
             )
         )
 
-    export_index = 2 + len(primary_packs)
-    slots.append(
-        synthetic_slot_from_source(
-            f"T{export_index}",
-            export_slots[0],
-            slot_map,
-            defaults,
-            compare_to="T0",
-            name="winner_full_gptq",
-            family="export_winner",
-            notes_suffix=["winner_of=deferred_export_baseline"],
+    next_index = 2 + len(primary_packs)
+    remaining_capacity = max(8 - next_index, 0)
+    if remaining_capacity >= 1:
+        slots.append(
+            synthetic_slot_from_source(
+                f"T{next_index}",
+                export_slots[0],
+                slot_map,
+                defaults,
+                compare_to="T0",
+                name="winner_full_gptq",
+                family="export_winner",
+                notes_suffix=["winner_of=deferred_export_baseline"],
+            )
         )
-    )
-    slots.append(
-        synthetic_slot_from_source(
-            f"T{export_index + 1}",
-            export_slots[1],
-            slot_map,
-            defaults,
-            compare_to=f"T{export_index}",
-            name="winner_full_gptq_plus_ema",
-            family="export_winner_child",
-            notes_suffix=["winner_of=deferred_export_child"],
+        next_index += 1
+        remaining_capacity -= 1
+    if remaining_capacity >= 1:
+        slots.append(
+            synthetic_slot_from_source(
+                f"T{next_index}",
+                export_slots[1],
+                slot_map,
+                defaults,
+                compare_to=f"T{next_index - 1}",
+                name="winner_full_gptq_plus_ema",
+                family="export_winner_child",
+                notes_suffix=["winner_of=deferred_export_child"],
+            )
         )
-    )
-
-    mix_sources = [export_slots[0], winners_by_pack[primary_packs[0]]]
-    slots.append(
-        synthetic_composite_slot(
-            f"T{export_index + 2}",
-            mix_sources,
-            slot_map,
-            defaults,
-            base_control_slot=control_slots[0],
-            compare_to="T0",
-            name=f"mix_full_gptq_{primary_packs[0]}",
-            family="tournament_mix",
-            why="Tests whether the strongest export patch and the highest-priority lead pack reinforce each other.",
-            validates="Export alignment and the new lead hailmary lane are complementary.",
-            falsifies="One lane dominates enough that the composition is not worth the complexity.",
+        next_index += 1
+        remaining_capacity -= 1
+    if remaining_capacity >= 1:
+        mix_sources = [export_slots[0], winners_by_pack[primary_packs[0]]]
+        slots.append(
+            synthetic_composite_slot(
+                f"T{next_index}",
+                mix_sources,
+                slot_map,
+                defaults,
+                base_control_slot=control_slots[0],
+                compare_to="T0",
+                name=f"mix_full_gptq_{primary_packs[0]}",
+                family="tournament_mix",
+                why="Tests whether the strongest export patch and the highest-priority lead pack reinforce each other.",
+                validates="Export alignment and the new lead hailmary lane are complementary.",
+                falsifies="One lane dominates enough that the composition is not worth the complexity.",
+            )
         )
-    )
     return config_with_slots_and_pack(config, final_pack, slots)
 
 
@@ -1111,17 +1118,28 @@ def tournament_stage_plan(config: dict[str, Any], slot_map: dict[str, dict[str, 
                 "promotion_rule": "support_pack_only_no_direct_finalist_promotion",
             }
         )
+    finalist_shape = ["T0 control", "T1 control_repeat"] + [
+        f"T{index} winner_{pack_name}" for index, pack_name in enumerate(settings["primary_packs"], start=2)
+    ]
+    next_index = 2 + len(settings["primary_packs"])
+    remaining_capacity = max(8 - next_index, 0)
+    if remaining_capacity >= 1:
+        finalist_shape.append(f"T{next_index} winner_full_gptq")
+        next_index += 1
+        remaining_capacity -= 1
+    if remaining_capacity >= 1:
+        finalist_shape.append(f"T{next_index} winner_full_gptq_plus_ema")
+        next_index += 1
+        remaining_capacity -= 1
+    if remaining_capacity >= 1:
+        finalist_shape.append(f"T{next_index} mix_full_gptq_{settings['primary_packs'][0]}")
     plan.append(
         {
             "finalist_wave": {
                 "pack": settings["final_pack"],
                 "sanity_phase": "sanity_finalists",
                 "long_phase": "finalists_long",
-                "shape": ["T0 control", "T1 control_repeat"]
-                + [f"T{index} winner_{pack_name}" for index, pack_name in enumerate(settings["primary_packs"], start=2)]
-                + [f"T{2 + len(settings['primary_packs'])} winner_full_gptq"]
-                + [f"T{3 + len(settings['primary_packs'])} winner_full_gptq_plus_ema"]
-                + [f"T{4 + len(settings['primary_packs'])} mix_full_gptq_{settings['primary_packs'][0]}"],
+                "shape": finalist_shape,
                 "promotion_rule": "best finalist after 600s on 1xH100",
             },
             "champion_8x": {

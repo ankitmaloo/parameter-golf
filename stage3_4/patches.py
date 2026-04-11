@@ -341,13 +341,351 @@ def patch_late_branch_finishers(source: str) -> str:
     return source
 
 
+# ===========================================================================
+# N-GRAM LOGIT BIAS (EVAL-TIME)
+#
+# At eval time, compute bigram/trigram frequency tables from prior context.
+# Add a weighted logit bias to model output. Zero training cost.
+# ===========================================================================
+
+def patch_ngram_bias(source: str) -> str:
+    name = "ngram_bias"
+    # Add env vars
+    source = _replace_unique(
+        source,
+        '    late_qat_threshold = float(os.environ.get("LATE_QAT_THRESHOLD", 0.15))',
+        '    late_qat_threshold = float(os.environ.get("LATE_QAT_THRESHOLD", 0.15))\n'
+        '    ngram_bias = bool(int(os.environ.get("NGRAM_BIAS", "0")))\n'
+        '    ngram_alpha = float(os.environ.get("NGRAM_ALPHA", "0.15"))  # bigram weight\n'
+        '    ngram_beta = float(os.environ.get("NGRAM_BETA", "0.10"))   # trigram weight',
+        name,
+    )
+
+    # Add ngram bias function before eval_val_sliding
+    source = _replace_unique(
+        source,
+        'def eval_val_sliding(\n'
+        '    args: Hyperparameters,\n'
+        '    base_model: nn.Module,\n'
+        '    rank: int,\n'
+        '    world_size: int,\n'
+        '    device: torch.device,\n'
+        '    val_tokens: Tensor,\n'
+        '    base_bytes_lut: Tensor,\n'
+        '    has_leading_space_lut: Tensor,\n'
+        '    is_boundary_token_lut: Tensor,\n'
+        '    stride: int,\n'
+        '    batch_seqs: int = 32,\n'
+        '    eval_seq_len: int | None = None,\n'
+        ') -> tuple[float, float]:',
+        'def compute_ngram_bias(\n'
+        '    tokens: Tensor, vocab_size: int, alpha: float, beta: float,\n'
+        ') -> Tensor:\n'
+        '    """Compute n-gram frequency-based logit bias from context tokens.\n'
+        '    \n'
+        '    For each position t, builds:\n'
+        '      - bigram_counts[prev, v]: how many times token v followed prev in context[:t]\n'
+        '      - trigram_counts[(pp, prev), v]: how many times v followed (pp, prev)\n'
+        '    Then: bias[t, v] = alpha * log(1 + bigram_counts[tokens[t-1], v])\n'
+        '                     + beta  * log(1 + trigram_counts[(tokens[t-2], tokens[t-1]), v])\n'
+        '    \n'
+        '    Returns a bias tensor of shape [len(tokens), vocab_size].\n'
+        '    """\n'
+        '    T = tokens.shape[0]\n'
+        '    bias = torch.zeros(T, vocab_size, dtype=torch.float32, device=tokens.device)\n'
+        '    if T < 2:\n'
+        '        return bias\n'
+        '    # Bigram table: for each context token c, count how often each v follows c\n'
+        '    # Use dict of tensors to avoid V*V memory\n'
+        '    bi_table: dict[int, Tensor] = {}  # bi_table[prev] = counts[V]\n'
+        '    tri_table: dict[tuple[int, int], Tensor] = {}  # tri_table[(pp, prev)] = counts[V]\n'
+        '    dev = tokens.device\n'
+        '    for t in range(1, T):\n'
+        '        prev = tokens[t - 1].item()\n'
+        '        # Apply current bigram bias at position t\n'
+        '        if alpha > 0 and prev in bi_table:\n'
+        '            bias[t] += alpha * torch.log1p(bi_table[prev])\n'
+        '        # Apply current trigram bias at position t\n'
+        '        if beta > 0 and t >= 2:\n'
+        '            pp = tokens[t - 2].item()\n'
+        '            key = (pp, prev)\n'
+        '            if key in tri_table:\n'
+        '                bias[t] += beta * torch.log1p(tri_table[key])\n'
+        '        # Update tables with the actual token at position t\n'
+        '        # (this becomes available for future positions)\n'
+        '        actual = tokens[t].item() if t < T else -1\n'
+        '        if actual >= 0:\n'
+        '            if prev not in bi_table:\n'
+        '                bi_table[prev] = torch.zeros(vocab_size, dtype=torch.float32, device=dev)\n'
+        '            bi_table[prev][actual] += 1.0\n'
+        '            if t >= 2:\n'
+        '                pp = tokens[t - 2].item()\n'
+        '                key = (pp, prev)\n'
+        '                if key not in tri_table:\n'
+        '                    tri_table[key] = torch.zeros(vocab_size, dtype=torch.float32, device=dev)\n'
+        '                tri_table[key][actual] += 1.0\n'
+        '    return bias\n'
+        '\n'
+        '\n'
+        'def eval_val_sliding(\n'
+        '    args: Hyperparameters,\n'
+        '    base_model: nn.Module,\n'
+        '    rank: int,\n'
+        '    world_size: int,\n'
+        '    device: torch.device,\n'
+        '    val_tokens: Tensor,\n'
+        '    base_bytes_lut: Tensor,\n'
+        '    has_leading_space_lut: Tensor,\n'
+        '    is_boundary_token_lut: Tensor,\n'
+        '    stride: int,\n'
+        '    batch_seqs: int = 32,\n'
+        '    eval_seq_len: int | None = None,\n'
+        ') -> tuple[float, float]:',
+        name,
+    )
+
+    # In eval_val_sliding, after computing logits, apply ngram bias before loss
+    source = _replace_unique(
+        source,
+        '            nll = F.cross_entropy(\n'
+        '                logits.reshape(-1, logits.size(-1)).float(),\n'
+        '                y_batch.reshape(-1),\n'
+        '                reduction="none",\n'
+        '            ).reshape(bsz, seq_len)',
+        '            if args.ngram_bias:\n'
+        '                # Apply n-gram logit bias per sequence in batch\n'
+        '                for _bi in range(bsz):\n'
+        '                    wlen = wlens[_bi]\n'
+        '                    if wlen > 1:\n'
+        '                        _ctx = x_batch[_bi, :wlen]\n'
+        '                        _bias = compute_ngram_bias(_ctx, logits.size(-1), args.ngram_alpha, args.ngram_beta)\n'
+        '                        logits[_bi, :wlen] = logits[_bi, :wlen] + _bias.to(logits.dtype)\n'
+        '            nll = F.cross_entropy(\n'
+        '                logits.reshape(-1, logits.size(-1)).float(),\n'
+        '                y_batch.reshape(-1),\n'
+        '                reduction="none",\n'
+        '            ).reshape(bsz, seq_len)',
+        name,
+    )
+    return source
+
+
+# ===========================================================================
+# SLOT: PER-SAMPLE L-BFGS OPTIMIZATION (EVAL-TIME)
+#
+# Per-sample optimization of a logit bias vector at eval time. Each sample
+# gets N L-BFGS steps to find a bias that minimizes its own loss.
+# This is the paradigm from PR #1507 that reaches 0.2282 BPB.
+# ===========================================================================
+
+def patch_slot_basic(source: str) -> str:
+    name = "slot_basic"
+    # Add env vars
+    source = _replace_unique(
+        source,
+        '    late_qat_threshold = float(os.environ.get("LATE_QAT_THRESHOLD", 0.15))',
+        '    late_qat_threshold = float(os.environ.get("LATE_QAT_THRESHOLD", 0.15))\n'
+        '    slot_enabled = bool(int(os.environ.get("SLOT_ENABLED", "0")))\n'
+        '    slot_lbfgs_iters = int(os.environ.get("SLOT_LBFGS_ITERS", "20"))\n'
+        '    slot_lr = float(os.environ.get("SLOT_LR", "0.1"))',
+        name,
+    )
+
+    # Add SLOT optimization function before eval_val_sliding
+    source = _replace_unique(
+        source,
+        'def eval_val_sliding(\n'
+        '    args: Hyperparameters,\n'
+        '    base_model: nn.Module,\n'
+        '    rank: int,\n'
+        '    world_size: int,\n'
+        '    device: torch.device,\n'
+        '    val_tokens: Tensor,\n'
+        '    base_bytes_lut: Tensor,\n'
+        '    has_leading_space_lut: Tensor,\n'
+        '    is_boundary_token_lut: Tensor,\n'
+        '    stride: int,\n'
+        '    batch_seqs: int = 32,\n'
+        '    eval_seq_len: int | None = None,\n'
+        ') -> tuple[float, float]:',
+        'def slot_optimize_bias(\n'
+        '    model_fn, x: Tensor, y: Tensor, vocab_size: int,\n'
+        '    max_iter: int = 20, lr: float = 0.1,\n'
+        ') -> Tensor:\n'
+        '    """Per-sample L-BFGS optimization of a logit bias vector.\n'
+        '    \n'
+        '    Optimizes delta in R^V to minimize CE(logits + delta, targets).\n'
+        '    The model forward is frozen; only delta is optimized.\n'
+        '    Returns final biased logits.\n'
+        '    """\n'
+        '    bsz, seq_len = x.shape\n'
+        '    # Get base logits (frozen, no grad needed for model params)\n'
+        '    with torch.no_grad():\n'
+        '        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):\n'
+        '            base_logits = model_fn(x).float()\n'
+        '    # Detach to ensure no graph connection to model\n'
+        '    base_logits = base_logits.detach()\n'
+        '    # Initialize bias to zero — this is the only optimized variable\n'
+        '    delta = torch.zeros(vocab_size, dtype=torch.float32, device=x.device, requires_grad=True)\n'
+        '    y_flat = y.reshape(-1)\n'
+        '    def closure():\n'
+        '        # L-BFGS calls closure multiple times per step; zero grad each time\n'
+        '        if delta.grad is not None:\n'
+        '            delta.grad.zero_()\n'
+        '        biased = base_logits + delta[None, None, :]  # [B, T, V]\n'
+        '        loss = F.cross_entropy(biased.reshape(-1, vocab_size), y_flat, reduction="mean")\n'
+        '        loss.backward()\n'
+        '        return loss\n'
+        '    opt = torch.optim.LBFGS(\n'
+        '        [delta], lr=lr, max_iter=max_iter,\n'
+        '        line_search_fn="strong_wolfe",\n'
+        '    )\n'
+        '    opt.step(closure)\n'
+        '    with torch.no_grad():\n'
+        '        final_logits = base_logits + delta[None, None, :]\n'
+        '    return final_logits\n'
+        '\n'
+        '\n'
+        'def eval_val_sliding(\n'
+        '    args: Hyperparameters,\n'
+        '    base_model: nn.Module,\n'
+        '    rank: int,\n'
+        '    world_size: int,\n'
+        '    device: torch.device,\n'
+        '    val_tokens: Tensor,\n'
+        '    base_bytes_lut: Tensor,\n'
+        '    has_leading_space_lut: Tensor,\n'
+        '    is_boundary_token_lut: Tensor,\n'
+        '    stride: int,\n'
+        '    batch_seqs: int = 32,\n'
+        '    eval_seq_len: int | None = None,\n'
+        ') -> tuple[float, float]:',
+        name,
+    )
+
+    # In eval_val_sliding, apply SLOT optimization before computing NLL
+    source = _replace_unique(
+        source,
+        '            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):\n'
+        '                logits = compiled_logits(x_batch)\n'
+        '            nll = F.cross_entropy(',
+        '            if args.slot_enabled:\n'
+        '                # SLOT: per-batch L-BFGS optimization of logit bias\n'
+        '                # enable_grad() needed because eval loop is inside inference_mode()\n'
+        '                with torch.enable_grad():\n'
+        '                    logits = slot_optimize_bias(\n'
+        '                        base_model.forward_logits, x_batch, y_batch,\n'
+        '                        vocab_size=args.vocab_size,\n'
+        '                        max_iter=args.slot_lbfgs_iters, lr=args.slot_lr,\n'
+        '                    )\n'
+        '            else:\n'
+        '                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):\n'
+        '                    logits = compiled_logits(x_batch)\n'
+        '            nll = F.cross_entropy(',
+        name,
+    )
+    return source
+
+
+# ===========================================================================
+# TTT AGGRESSIVE (POST-TRAINING, 10 EPOCHS)
+#
+# Same as stage3_1 ttt_aggressive but for the stage3_4 pipeline.
+# Push TTT to 10 epochs with cosine LR, unfreeze block 1.
+# ===========================================================================
+
+def patch_ttt_aggressive(source: str) -> str:
+    name = "ttt_aggressive"
+    import re as _re
+    # Add env vars
+    source = _replace_unique(
+        source,
+        '    late_qat_threshold = float(os.environ.get("LATE_QAT_THRESHOLD", 0.15))',
+        '    late_qat_threshold = float(os.environ.get("LATE_QAT_THRESHOLD", 0.15))\n'
+        '    ttt_enabled = bool(int(os.environ.get("TTT_ENABLED", "0")))\n'
+        '    ttt_epochs = int(os.environ.get("TTT_EPOCHS", "5"))\n'
+        '    ttt_lr = float(os.environ.get("TTT_LR", "0.00045"))\n'
+        '    ttt_freeze_blocks = os.environ.get("TTT_FREEZE_BLOCKS", "0,1")\n'
+        '    ttt_cosine = bool(int(os.environ.get("TTT_COSINE", "0")))',
+        name,
+    )
+
+    # Insert TTT loop after EMA weights are applied, before export quantization.
+    # Use a longer anchor to avoid ambiguity with branch_export_eval's copy.
+    source = _replace_unique(
+        source,
+        '    full_state_dict = base_model.state_dict()\n'
+        '    export_sd = {k: v for k, v in full_state_dict.items() if "mtp_heads" not in k}\n'
+        '    excluded_mtp = sum(int(t.numel()) for k, t in full_state_dict.items() if "mtp_heads" in k)',
+        '    # ---- TEST-TIME TRAINING (TTT) ----\n'
+        '    if args.ttt_enabled:\n'
+        '        import re as _re\n'
+        '        freeze_blocks = set(int(b) for b in args.ttt_freeze_blocks.split(",") if b.strip())\n'
+        '        ttt_params = []\n'
+        '        frozen_count = 0\n'
+        '        for pname, p in base_model.named_parameters():\n'
+        '            m = _re.match(r"blocks\\.(\\d+)\\.", pname)\n'
+        '            if m and int(m.group(1)) in freeze_blocks:\n'
+        '                p.requires_grad_(False)\n'
+        '                frozen_count += p.numel()\n'
+        '            else:\n'
+        '                p.requires_grad_(True)\n'
+        '                ttt_params.append(p)\n'
+        '        log0(f"ttt:start epochs:{args.ttt_epochs} lr:{args.ttt_lr} "\n'
+        '             f"freeze:{freeze_blocks} cosine:{args.ttt_cosine} "\n'
+        '             f"unfrozen:{sum(p.numel() for p in ttt_params)} frozen:{frozen_count}")\n'
+        '        ttt_opt = torch.optim.AdamW(ttt_params, lr=args.ttt_lr, weight_decay=0.01, fused=True)\n'
+        '        base_model.train()\n'
+        '        for ttt_epoch in range(args.ttt_epochs):\n'
+        '            if args.ttt_cosine:\n'
+        '                ttt_lr_now = args.ttt_lr * 0.5 * (1.0 + math.cos(math.pi * ttt_epoch / args.ttt_epochs))\n'
+        '                for g in ttt_opt.param_groups:\n'
+        '                    g["lr"] = ttt_lr_now\n'
+        '            total_seqs = (val_tokens.numel() - 1) // args.train_seq_len\n'
+        '            ttt_loss_sum = 0.0\n'
+        '            ttt_steps = 0\n'
+        '            for seq_start in range(0, total_seqs, 8):\n'
+        '                seq_end = min(seq_start + 8, total_seqs)\n'
+        '                raw_s = seq_start * args.train_seq_len\n'
+        '                raw_e = seq_end * args.train_seq_len + 1\n'
+        '                local = val_tokens[raw_s:raw_e].to(device=device, dtype=torch.int64)\n'
+        '                x = local[:-1].reshape(-1, args.train_seq_len)\n'
+        '                y = local[1:].reshape(-1, args.train_seq_len)\n'
+        '                ttt_opt.zero_grad(set_to_none=True)\n'
+        '                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):\n'
+        '                    loss = base_model(x, y)\n'
+        '                loss.backward()\n'
+        '                torch.nn.utils.clip_grad_norm_(ttt_params, 1.0)\n'
+        '                ttt_opt.step()\n'
+        '                ttt_loss_sum += loss.item()\n'
+        '                ttt_steps += 1\n'
+        '            log0(f"ttt:epoch:{ttt_epoch + 1}/{args.ttt_epochs} "\n'
+        '                 f"avg_loss:{ttt_loss_sum / max(ttt_steps, 1):.4f}")\n'
+        '        for p in base_model.parameters():\n'
+        '            p.requires_grad_(True)\n'
+        '        base_model.eval()\n'
+        '        log0("ttt:done")\n'
+        '    full_state_dict = base_model.state_dict()\n'
+        '    export_sd = {k: v for k, v in full_state_dict.items() if "mtp_heads" not in k}\n'
+        '    excluded_mtp = sum(int(t.numel()) for k, t in full_state_dict.items() if "mtp_heads" in k)',
+        name,
+    )
+    return source
+
+
 PATCH_ORDER = {
     "late_branch_finishers": 10,
+    "ngram_bias": 20,
+    "slot_basic": 30,
+    "ttt_aggressive": 40,
 }
 
 
 PATCHES = {
     "late_branch_finishers": patch_late_branch_finishers,
+    "ngram_bias": patch_ngram_bias,
+    "slot_basic": patch_slot_basic,
+    "ttt_aggressive": patch_ttt_aggressive,
 }
 
 

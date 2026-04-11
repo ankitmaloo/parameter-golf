@@ -1,7 +1,7 @@
 {
   "batch_id": "hailmary_r2",
-  "description": "Moonshot parameter-golf runner. Rebuilt around process-split and deploy-alignment hypotheses first, with support packs for geometry and throughput and deferred rebuild packs for larger unimplemented broken-invariant ideas.",
-  "default_pack": "phase_split",
+  "description": "Moonshot parameter-golf runner on the executable strong 8192-tokenizer local base. Active packs are process-split, TTT, and deploy-alignment experiments; larger frontier-rebase ideas remain explicitly deferred.",
+  "default_pack": "ttt_family",
   "benchmarks": {
     "ours_bpb": 1.1631,
     "merged_sota_bpb": 1.1233,
@@ -12,39 +12,50 @@
     "MAX_WALLCLOCK_SECONDS": "600",
     "TRAIN_LOG_EVERY": "50",
     "VAL_LOSS_EVERY": "4000",
-    "VOCAB_SIZE": "1024",
+    "VOCAB_SIZE": "8192",
     "NUM_HEADS": "8",
     "NUM_KV_HEADS": "4",
     "MODEL_DIM": "512",
     "NUM_LAYERS": "11",
     "MLP_MULT": "3",
     "TIE_EMBEDDINGS": "1",
-    "DATA_PATH": "./data/datasets/fineweb10B_sp1024",
-    "TOKENIZER_PATH": "./data/tokenizers/fineweb_1024_bpe.model",
+    "DATA_PATH": "./data/datasets/fineweb10B_sp8192",
+    "TOKENIZER_PATH": "./data/tokenizers/fineweb_8192_bpe.model",
     "TRAIN_SEQ_LEN": "2048",
     "TRAIN_BATCH_TOKENS": "786432",
     "TIED_EMBED_LR": "0.035",
-    "MATRIX_LR": "0.025",
+    "MATRIX_LR": "0.022",
     "SCALAR_LR": "0.025",
     "MUON_MOMENTUM": "0.99",
     "MUON_MOMENTUM_WARMUP_START": "0.92",
     "MUON_MOMENTUM_WARMUP_STEPS": "1500",
+    "MUON_WD": "0.095",
+    "ADAM_WD": "0.04",
     "GRAD_CLIP_NORM": "0.3",
     "WARMDOWN_ITERS": "3500",
-    "EVAL_STRIDE": "64"
+    "EVAL_STRIDE": "64",
+    "QK_GAIN_INIT": "5.25",
+    "XSA_LAST_N": "11",
+    "ROPE_DIMS": "16",
+    "LN_SCALE": "1",
+    "BIGRAM_VOCAB_SIZE": "3072",
+    "BIGRAM_DIM": "112",
+    "VE_ENABLED": "1",
+    "VE_DIM": "128",
+    "VE_LAYERS": "9,10",
+    "SWA_ENABLED": "1",
+    "SWA_EVERY": "50",
+    "LATE_QAT_THRESHOLD": "0.15"
   },
   "tournament": {
     "primary_packs": [
+      "ttt_family",
       "phase_split",
       "checkpoint_selection",
       "staged_curriculum"
     ],
     "support_packs": [
-      "alternating_objective",
-      "moonshot_core",
-      "moonshot_second_wave",
-      "moonshot_geometry",
-      "moonshot_throughput"
+      "alternating_objective"
     ],
     "deferred_rebuild_packs": [
       "parameter_family_split",
@@ -61,6 +72,16 @@
     "final_pack": "tournament_finalists"
   },
   "packs": {
+    "ttt_family": [
+      "T0",
+      "T1",
+      "T2",
+      "T3",
+      "T4",
+      "T5",
+      "T6",
+      "T7"
+    ],
     "phase_split": [
       "P0",
       "P1",
@@ -196,6 +217,212 @@
     }
   },
   "slots": [
+    {
+      "slot": "T0",
+      "name": "ttt_family_control_base",
+      "role": "control",
+      "runner_mode": "train",
+      "implementation_state": "ready",
+      "compare_to": null,
+      "family": "ttt_family_control",
+      "why": "Primary control for the rebased pre-quant TTT family pack.",
+      "validates": "TTT variants are measured against the same strong static trunk.",
+      "falsifies": "The TTT family pack lacks a stable reference.",
+      "env": {},
+      "notes": []
+    },
+    {
+      "slot": "T1",
+      "name": "ttt_family_control_repeat",
+      "role": "control",
+      "runner_mode": "train",
+      "implementation_state": "ready",
+      "compare_to": "T0",
+      "family": "ttt_family_control_repeat",
+      "why": "Noise floor for the TTT family pack.",
+      "validates": "TTT deltas are large enough to rank confidently.",
+      "falsifies": "Short-horizon variation is too large for this lane.",
+      "env": {
+        "SEED": "42"
+      },
+      "notes": []
+    },
+    {
+      "slot": "T2",
+      "name": "ttt_last2_raw_state",
+      "role": "candidate",
+      "runner_mode": "train",
+      "implementation_state": "ready",
+      "patches": [
+        "pre_quant_ttt"
+      ],
+      "compare_to": "T0",
+      "family": "pre_quant_ttt",
+      "why": "Simplest TTT baseline: adapt only the last 2 blocks from the raw final state.",
+      "validates": "Even a narrow raw-state pre-quant TTT finisher is a live mechanism here.",
+      "falsifies": "The TTT lane needs stronger state selection or broader adaptation to matter.",
+      "env": {
+        "PRE_QUANT_TTT_ENABLE": "1",
+        "PRE_QUANT_TTT_EPOCHS": "3",
+        "PRE_QUANT_TTT_LR": "0.0005",
+        "PRE_QUANT_TTT_FREEZE_BLOCKS": "9",
+        "PRE_QUANT_TTT_STRIDE": "256",
+        "PRE_QUANT_TTT_CHUNKS": "32",
+        "PRE_QUANT_TTT_BLOCK_LR_DECAY": "1.0"
+      },
+      "notes": []
+    },
+    {
+      "slot": "T3",
+      "name": "ttt_last2_ema_state",
+      "role": "candidate",
+      "runner_mode": "train",
+      "implementation_state": "ready",
+      "patches": [
+        "ema_export",
+        "pre_quant_ttt"
+      ],
+      "compare_to": "T2",
+      "family": "pre_quant_ttt_ema",
+      "why": "Tests whether the best simple TTT base object is EMA rather than the raw final checkpoint.",
+      "validates": "EMA remains the right precursor state for narrow pre-quant TTT.",
+      "falsifies": "TTT largely erases the raw-vs-EMA distinction for this simple finisher.",
+      "env": {
+        "EMA_ENABLE": "1",
+        "EMA_DECAY": "0.997",
+        "PRE_QUANT_TTT_ENABLE": "1",
+        "PRE_QUANT_TTT_EPOCHS": "3",
+        "PRE_QUANT_TTT_LR": "0.0005",
+        "PRE_QUANT_TTT_FREEZE_BLOCKS": "9",
+        "PRE_QUANT_TTT_STRIDE": "256",
+        "PRE_QUANT_TTT_CHUNKS": "32",
+        "PRE_QUANT_TTT_BLOCK_LR_DECAY": "1.0"
+      },
+      "notes": []
+    },
+    {
+      "slot": "T4",
+      "name": "ttt_last2_ema_longer",
+      "role": "candidate",
+      "runner_mode": "train",
+      "implementation_state": "ready",
+      "patches": [
+        "ema_export",
+        "pre_quant_ttt"
+      ],
+      "compare_to": "T3",
+      "family": "pre_quant_ttt_epochs",
+      "why": "Tests whether the TTT gain is limited more by horizon than by finisher form.",
+      "validates": "The late TTT lane is compute-starved and benefits from more adaptation even without changing the finisher law.",
+      "falsifies": "Extra TTT epochs mostly overfit or waste time.",
+      "env": {
+        "EMA_ENABLE": "1",
+        "EMA_DECAY": "0.997",
+        "PRE_QUANT_TTT_ENABLE": "1",
+        "PRE_QUANT_TTT_EPOCHS": "6",
+        "PRE_QUANT_TTT_LR": "0.0005",
+        "PRE_QUANT_TTT_FREEZE_BLOCKS": "9",
+        "PRE_QUANT_TTT_STRIDE": "256",
+        "PRE_QUANT_TTT_CHUNKS": "32",
+        "PRE_QUANT_TTT_BLOCK_LR_DECAY": "1.0"
+      },
+      "notes": []
+    },
+    {
+      "slot": "T5",
+      "name": "ttt_broad_dttt_tail",
+      "role": "candidate",
+      "runner_mode": "train",
+      "implementation_state": "ready",
+      "patches": [
+        "ema_export",
+        "pre_quant_ttt"
+      ],
+      "compare_to": "T3",
+      "family": "dttt_tail",
+      "why": "Broader upper-trunk adaptation with blockwise LR decay is the cleanest discriminative-TTT proxy we can support now.",
+      "validates": "The TTT law matters, not just whether TTT is on.",
+      "falsifies": "The broader tail adds cost without beating the simpler last-2 finisher.",
+      "env": {
+        "EMA_ENABLE": "1",
+        "EMA_DECAY": "0.997",
+        "PRE_QUANT_TTT_ENABLE": "1",
+        "PRE_QUANT_TTT_EPOCHS": "4",
+        "PRE_QUANT_TTT_LR": "0.0005",
+        "PRE_QUANT_TTT_FREEZE_BLOCKS": "2",
+        "PRE_QUANT_TTT_STRIDE": "256",
+        "PRE_QUANT_TTT_CHUNKS": "32",
+        "PRE_QUANT_TTT_BLOCK_LR_DECAY": "0.7"
+      },
+      "notes": []
+    },
+    {
+      "slot": "T6",
+      "name": "ttt_checkpoint_selected",
+      "role": "candidate",
+      "runner_mode": "train",
+      "implementation_state": "ready",
+      "patches": [
+        "checkpoint_selection",
+        "pre_quant_ttt"
+      ],
+      "compare_to": "T3",
+      "family": "checkpoint_selected_ttt",
+      "why": "Tests whether the best TTT start state should come from a late deployed-state bakeoff rather than plain EMA.",
+      "validates": "Checkpoint selection and TTT stack cleanly in the same lane.",
+      "falsifies": "The choice of starting state is mostly irrelevant once TTT runs.",
+      "env": {
+        "SNAPSHOT_SELECT_ENABLE": "1",
+        "SNAPSHOT_SELECT_MODE": "deployed_score",
+        "SNAPSHOT_SELECT_SCORE": "deployed",
+        "SNAPSHOT_SELECT_LAST_K": "8",
+        "SNAPSHOT_SELECT_EVERY": "250",
+        "SNAPSHOT_SELECT_START_FRAC": "0.72",
+        "PRE_QUANT_TTT_ENABLE": "1",
+        "PRE_QUANT_TTT_EPOCHS": "3",
+        "PRE_QUANT_TTT_LR": "0.0005",
+        "PRE_QUANT_TTT_FREEZE_BLOCKS": "9",
+        "PRE_QUANT_TTT_STRIDE": "256",
+        "PRE_QUANT_TTT_CHUNKS": "32",
+        "PRE_QUANT_TTT_BLOCK_LR_DECAY": "1.0"
+      },
+      "notes": []
+    },
+    {
+      "slot": "T7",
+      "name": "ttt_checkpoint_selected_plus_qat",
+      "role": "candidate",
+      "runner_mode": "train",
+      "implementation_state": "ready",
+      "patches": [
+        "checkpoint_selection",
+        "late_qat_active",
+        "pre_quant_ttt"
+      ],
+      "compare_to": "T6",
+      "family": "checkpoint_selected_ttt_plus_qat",
+      "why": "This is the strongest honest bridge from our existing deploy-alignment patches into the new pre-quant TTT lane.",
+      "validates": "Late deploy shaping still matters when the stage ends with TTT rather than plain export.",
+      "falsifies": "TTT absorbs most of the benefit and the extra late-QAT machinery is decorative.",
+      "env": {
+        "SNAPSHOT_SELECT_ENABLE": "1",
+        "SNAPSHOT_SELECT_MODE": "deployed_score",
+        "SNAPSHOT_SELECT_SCORE": "deployed",
+        "SNAPSHOT_SELECT_LAST_K": "8",
+        "SNAPSHOT_SELECT_EVERY": "250",
+        "SNAPSHOT_SELECT_START_FRAC": "0.72",
+        "LATE_QAT_ENABLE": "1",
+        "LATE_QAT_THRESHOLD": "0.15",
+        "PRE_QUANT_TTT_ENABLE": "1",
+        "PRE_QUANT_TTT_EPOCHS": "4",
+        "PRE_QUANT_TTT_LR": "0.0005",
+        "PRE_QUANT_TTT_FREEZE_BLOCKS": "2",
+        "PRE_QUANT_TTT_STRIDE": "256",
+        "PRE_QUANT_TTT_CHUNKS": "32",
+        "PRE_QUANT_TTT_BLOCK_LR_DECAY": "0.7"
+      },
+      "notes": []
+    },
     {
       "slot": "P0",
       "name": "phase_split_control_base",

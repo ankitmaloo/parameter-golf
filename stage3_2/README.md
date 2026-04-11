@@ -4,6 +4,12 @@ State-conditioned hyperparameter control for `parameter-golf`.
 
 This stage is a shift from static patches to bounded dynamic policies.
 
+As of 2026-04-09, this stage should be read as a support stage on the
+**current executable strong local base**, not as a full frontier-recurrence port.
+
+The active execution claim is defined in
+[execution_contract.md](/Users/ankit/Documents/dev/RL/nanoe/nanoevolve/pgolf/parameter-golf/stage3_2/execution_contract.md).
+
 The core idea is:
 
 - observe cheap training-state signals
@@ -26,6 +32,10 @@ Files:
   - bounded policy representation: signals, actions, gates, transitions, mutation targets
 - [hypotheses.md]( nanoevolve/pgolf/parameter-golf/stage3_2/hypotheses.md)
   - dynamic-policy hypothesis families and expected signal channels
+- [execution_contract.md]( /Users/ankit/Documents/dev/RL/nanoe/nanoevolve/pgolf/parameter-golf/stage3_2/execution_contract.md)
+  - active executable base, active mechanism families, and what is explicitly deferred
+- [rebase_hypotheses.md]( nanoevolve/pgolf/parameter-golf/stage3_2/rebase_hypotheses.md)
+  - deferred frontier-rebase controller hypotheses on top of SP4096/SP8192 + recurrence + full GPTQ + SDClip + embedding GPTQ + MuonEq-R
 - [search_plan.md]( nanoevolve/pgolf/parameter-golf/stage3_2/search_plan.md)
   - staged tournament design for evolving dynamic controllers
 - [patches.py]( nanoevolve/pgolf/parameter-golf/stage3_2/patches.py)
@@ -51,6 +61,27 @@ Working rule:
 - `hailmary` searched larger broken-invariant static/process hypotheses
 - `stage3_2` searches bounded state-conditioned control policies
 
+## 2026-04-09 Active Scope
+
+The April PR update changed the role of this stage.
+
+The current executable stage is no longer described as:
+
+- SP1024 helper optimization
+- generic late-QAT shaping
+- local schedule improvements on the old trunk
+
+The main missing mass is now:
+
+- `SP4096/SP8192`
+- `full GPTQ + SDClip + GPTQ embeddings`
+- `depth recurrence`
+- `MuonEq-R`
+
+So `stage3_2` should now be used as **process control on the current strong local base**, with the frontier-rebase controller ideas kept separate as deferred work.
+
+See [execution_contract.md](/Users/ankit/Documents/dev/RL/nanoe/nanoevolve/pgolf/parameter-golf/stage3_2/execution_contract.md) for the active runnable claim and [rebase_hypotheses.md]( nanoevolve/pgolf/parameter-golf/stage3_2/rebase_hypotheses.md) for the deferred frontier-rebase controller families.
+
 First runnable lead families:
 
 - `H201` late deploy gate
@@ -60,5 +91,12 @@ First runnable lead families:
 
 Support variants in the first pack:
 
-- `H202B` raw-scored checkpoint selection
-- `H206` systems-aware late deploy gate
+- `H207` best-state plus narrow pre-quant TTT
+- `H208` best-state plus broader dTTT-style tail
+
+Run:
+
+```bash
+python3 /Users/ankit/Documents/dev/RL/nanoe/nanoevolve/pgolf/parameter-golf/stage3_2/run_strategy.py --phase tournament --dry-run
+python3 /Users/ankit/Documents/dev/RL/nanoe/nanoevolve/pgolf/parameter-golf/stage3_2/run_strategy.py --phase tournament
+```

@@ -26,12 +26,17 @@ PATCH_ORDER: dict[str, int] = {
     "companding": 10,
     "fisher_bits": 20,
     "sparsify_before_quant": 30,
+    "sdclip_sweep": 35,
+    "int4_embed": 36,
+    "gptq_post_ttt": 37,
     # Lane A (training) — order matters for composability
     "byte_weighted_loss": 40,
     "tapered_mlp": 50,
     "quant_anneal": 60,
     "staged_objective": 70,
     "best_checkpoint": 80,
+    # Post-training
+    "ttt_aggressive": 90,
 }
 
 
@@ -200,7 +205,7 @@ def patch_companding(source: str) -> str:
 # Mechanism: After training, compute diagonal Fisher approximation
 # (= E[grad^2]) for each layer by running a few batches. Then allocate:
 #   - int8 to the top-K highest-Fisher layers (more bits for sensitive params)
-#   - int4 to the bottom-K lowest-Fisher layers (fewer bits, saves space)
+#   - int5 to the bottom-K lowest-Fisher layers (fewer bits, saves space)
 #   - int6 to the rest
 # The total artifact size stays within budget because int4 layers save
 # enough bytes to offset the int8 layers.
@@ -223,7 +228,7 @@ def patch_fisher_bits(source: str) -> str:
         ) + '\n'
         '    fisher_bits = bool(int(os.environ.get("FISHER_BITS", "0")))  # Fisher-aware bit allocation\n'
         '    fisher_n_int8 = int(os.environ.get("FISHER_N_INT8", "2"))  # layers getting int8\n'
-        '    fisher_n_int4 = int(os.environ.get("FISHER_N_INT4", "2"))  # layers getting int4',
+        '    fisher_n_int5 = int(os.environ.get("FISHER_N_INT5", "2"))  # layers getting int5',
         "fisher_bits",
     )
 
@@ -231,8 +236,8 @@ def patch_fisher_bits(source: str) -> str:
     source = _replace_unique(
         source,
         'def main() -> None:',
-        'def quantize_int4_per_row(t: Tensor, clip_range: int = 7) -> tuple[Tensor, Tensor]:\n'
-        '    """4-bit quantization: [-7, 7] range, per-row scaling with percentile search."""\n'
+        'def quantize_int5_per_row(t: Tensor, clip_range: int = 15) -> tuple[Tensor, Tensor]:\n'
+        '    """5-bit quantization: [-15, 15] range, per-row scaling with percentile search."""\n'
         '    t32 = t.float()\n'
         '    if t32.ndim == 2:\n'
         '        best_q, best_s, best_err = None, None, float("inf")\n'
@@ -281,16 +286,16 @@ def patch_fisher_bits(source: str) -> str:
         '\n'
         '\n'
         'def allocate_bits_by_fisher(\n'
-        '    fisher: dict[int, float], n_int8: int = 2, n_int4: int = 2,\n'
+        '    fisher: dict[int, float], n_int8: int = 2, n_int5: int = 2,\n'
         ') -> dict[int, int]:\n'
-        '    """Allocate bits per layer: highest Fisher → int8, lowest → int4, rest → int6."""\n'
+        '    """Allocate bits per layer: highest Fisher → int8, lowest → int5, rest → int6."""\n'
         '    sorted_layers = sorted(fisher.keys(), key=lambda l: fisher[l], reverse=True)\n'
         '    bits: dict[int, int] = {}\n'
         '    for i, l in enumerate(sorted_layers):\n'
         '        if i < n_int8:\n'
         '            bits[l] = 8\n'
-        '        elif i >= len(sorted_layers) - n_int4:\n'
-        '            bits[l] = 4\n'
+        '        elif i >= len(sorted_layers) - n_int5:\n'
+        '            bits[l] = 5\n'
         '        else:\n'
         '            bits[l] = 6\n'
         '    return bits\n'
@@ -322,11 +327,11 @@ def patch_fisher_bits(source: str) -> str:
         '                result[name + ".q"] = q\n'
         '                result[name + ".scale"] = s\n'
         '                meta[name] = {"type": "int8"}\n'
-        '            elif bits == 4:\n'
-        '                q, s = quantize_int4_per_row(t)\n'
+        '            elif bits == 5:\n'
+        '                q, s = quantize_int5_per_row(t)\n'
         '                result[name + ".q"] = q\n'
         '                result[name + ".scale"] = s\n'
-        '                meta[name] = {"type": "int4"}\n'
+        '                meta[name] = {"type": "int5"}\n'
         '            else:\n'
         '                q, s = quantize_int6_per_row(t)\n'
         '                result[name + ".q"] = q\n'
@@ -354,7 +359,7 @@ def patch_fisher_bits(source: str) -> str:
         '            model, train_loader, device, grad_accum_steps,\n'
         '            args.train_batch_tokens, args.train_seq_len,\n'
         '        )\n'
-        '        layer_bits = allocate_bits_by_fisher(fisher, args.fisher_n_int8, args.fisher_n_int4)\n'
+        '        layer_bits = allocate_bits_by_fisher(fisher, args.fisher_n_int8, args.fisher_n_int5)\n'
         '        log0(f"fisher_bits:fisher={dict(sorted(fisher.items()))}")\n'
         '        log0(f"fisher_bits:allocation={dict(sorted(layer_bits.items()))}")\n'
         '        quant_result, quant_meta = mixed_quantize_fisher(sd_cpu, {"mlp", "attn"}, layer_bits)\n'
@@ -389,7 +394,7 @@ def patch_sparsify_before_quant(source: str) -> str:
     # Add env vars
     last_env = '    late_qat_threshold = float(os.environ.get("LATE_QAT_THRESHOLD", 0.15))'
     for candidate in [
-        '    fisher_n_int4 = int(os.environ.get("FISHER_N_INT4", "2"))  # layers getting int4',
+        '    fisher_n_int5 = int(os.environ.get("FISHER_N_INT5", "2"))  # layers getting int5',
         '    compand_mu = float(os.environ.get("COMPAND_MU", "0"))  # μ-law companding: 0=off, 50-255=typical',
     ]:
         if candidate in source:
@@ -470,7 +475,7 @@ def patch_byte_weighted_loss(source: str) -> str:
     last_env = '    late_qat_threshold = float(os.environ.get("LATE_QAT_THRESHOLD", 0.15))'
     for candidate in [
         '    sparsify_frac = float(os.environ.get("SPARSIFY_FRAC", "0"))  # fraction of weights to zero before quant (0=off)',
-        '    fisher_n_int4 = int(os.environ.get("FISHER_N_INT4", "2"))  # layers getting int4',
+        '    fisher_n_int5 = int(os.environ.get("FISHER_N_INT5", "2"))  # layers getting int5',
         '    compand_mu = float(os.environ.get("COMPAND_MU", "0"))  # μ-law companding: 0=off, 50-255=typical',
     ]:
         if candidate in source:
@@ -557,7 +562,7 @@ def patch_tapered_mlp(source: str) -> str:
     for candidate in [
         '    byte_weighted_loss = bool(int(os.environ.get("BYTE_WEIGHTED_LOSS", "0")))  # weight CE by bytes/token',
         '    sparsify_frac = float(os.environ.get("SPARSIFY_FRAC", "0"))  # fraction of weights to zero before quant (0=off)',
-        '    fisher_n_int4 = int(os.environ.get("FISHER_N_INT4", "2"))  # layers getting int4',
+        '    fisher_n_int5 = int(os.environ.get("FISHER_N_INT5", "2"))  # layers getting int5',
         '    compand_mu = float(os.environ.get("COMPAND_MU", "0"))  # μ-law companding: 0=off, 50-255=typical',
     ]:
         if candidate in source:
@@ -684,7 +689,7 @@ def patch_quant_anneal(source: str) -> str:
         '    tapered_mlp_late = float(os.environ.get("TAPERED_MLP_LATE", "2.0"))    # late layers multiplier',
         '    byte_weighted_loss = bool(int(os.environ.get("BYTE_WEIGHTED_LOSS", "0")))  # weight CE by bytes/token',
         '    sparsify_frac = float(os.environ.get("SPARSIFY_FRAC", "0"))  # fraction of weights to zero before quant (0=off)',
-        '    fisher_n_int4 = int(os.environ.get("FISHER_N_INT4", "2"))  # layers getting int4',
+        '    fisher_n_int5 = int(os.environ.get("FISHER_N_INT5", "2"))  # layers getting int5',
         '    compand_mu = float(os.environ.get("COMPAND_MU", "0"))  # μ-law companding: 0=off, 50-255=typical',
     ]:
         if candidate in source:
@@ -963,6 +968,437 @@ def patch_best_checkpoint(source: str) -> str:
 
 
 # ===========================================================================
+# H9: SDCLIP K SWEEP (PER-LAYER)
+# Field: Information theory / rate-distortion
+#
+# Problem: quantize_int6_per_row tries 5 fixed percentiles for all layers.
+# But different layers have different weight distributions. The optimal
+# clipping threshold varies per layer.
+#
+# Mechanism: For each 2D matrix parameter, sweep k in {10.0, 11.5, 12.85,
+# 14.0, 16.0} and pick the k that minimizes reconstruction MSE. This is
+# strictly better than using a global fixed percentile search.
+# ===========================================================================
+
+def patch_sdclip_sweep(source: str) -> str:
+    # Add env var
+    source = _replace_unique(
+        source,
+        '    late_qat_threshold = float(os.environ.get("LATE_QAT_THRESHOLD", 0.15))',
+        '    late_qat_threshold = float(os.environ.get("LATE_QAT_THRESHOLD", 0.15))\n'
+        '    sdclip_sweep = bool(int(os.environ.get("SDCLIP_SWEEP", "0")))',
+        "sdclip_sweep",
+    )
+
+    # Replace quantize_int6_per_row with a version that sweeps k per-layer.
+    # The original tries 5 fixed percentiles. The new version sweeps SDClip k
+    # values (max / (k * std)) which is more principled.
+    source = _replace_unique(
+        source,
+        'def quantize_int6_per_row(t: Tensor, clip_range: int = 31) -> tuple[Tensor, Tensor]:\n'
+        '    t32 = t.float()\n'
+        '    if t32.ndim == 2:\n'
+        '        best_q, best_s, best_err = None, None, float(\'inf\')\n'
+        '        for pct in [0.9990, 0.9995, 0.9999, 0.99999, 1.0]:\n'
+        '            if pct < 1.0:\n'
+        '                row_clip = torch.quantile(t32.abs(), pct, dim=1)\n'
+        '            else:\n'
+        '                row_clip = t32.abs().amax(dim=1)\n'
+        '            s = (row_clip / clip_range).clamp_min(1.0 / clip_range).to(torch.float16)\n'
+        '            q = torch.clamp(torch.round(t32 / s.float()[:, None]), -clip_range, clip_range).to(torch.int8)\n'
+        '            recon = q.float() * s.float()[:, None]\n'
+        '            err = (t32 - recon).pow(2).mean().item()\n'
+        '            if err < best_err:\n'
+        '                best_q, best_s, best_err = q, s, err\n'
+        '        return best_q, best_s\n'
+        '    amax = t32.abs().max().item()\n'
+        '    scale = torch.tensor(amax / clip_range if amax > 0 else 1.0, dtype=torch.float16)\n'
+        '    q = torch.clamp(torch.round(t32 / scale.float()), -clip_range, clip_range).to(torch.int8)\n'
+        '    return q, scale',
+
+        '_SDCLIP_SWEEP: bool = False  # set from args before export\n'
+        '_SDCLIP_K_VALUES = [10.0, 11.5, 12.85, 14.0, 16.0]\n'
+        '\n'
+        'def quantize_int6_per_row(t: Tensor, clip_range: int = 31) -> tuple[Tensor, Tensor]:\n'
+        '    t32 = t.float()\n'
+        '    if t32.ndim == 2:\n'
+        '        best_q, best_s, best_err = None, None, float(\'inf\')\n'
+        '        if _SDCLIP_SWEEP:\n'
+        '            # SDClip sweep: union of k*std candidates AND original percentiles\n'
+        '            # This gives strictly more candidates to search over\n'
+        '            row_std = t32.std(dim=1).clamp_min(1e-12)\n'
+        '            row_amax = t32.abs().amax(dim=1)\n'
+        '            candidates: list[Tensor] = []\n'
+        '            # k * std candidates (the SDClip innovation)\n'
+        '            for k in _SDCLIP_K_VALUES:\n'
+        '                candidates.append((k * row_std).clamp_min(1e-12))\n'
+        '            # Original percentile candidates\n'
+        '            for pct in [0.9990, 0.9995, 0.9999, 0.99999]:\n'
+        '                candidates.append(torch.quantile(t32.abs(), pct, dim=1))\n'
+        '            candidates.append(row_amax)\n'
+        '            for row_clip in candidates:\n'
+        '                s = (row_clip / clip_range).clamp_min(1.0 / clip_range).to(torch.float16)\n'
+        '                q = torch.clamp(torch.round(t32 / s.float()[:, None]), -clip_range, clip_range).to(torch.int8)\n'
+        '                recon = q.float() * s.float()[:, None]\n'
+        '                err = (t32 - recon).pow(2).mean().item()\n'
+        '                if err < best_err:\n'
+        '                    best_q, best_s, best_err = q, s, err\n'
+        '        else:\n'
+        '            for pct in [0.9990, 0.9995, 0.9999, 0.99999, 1.0]:\n'
+        '                if pct < 1.0:\n'
+        '                    row_clip = torch.quantile(t32.abs(), pct, dim=1)\n'
+        '                else:\n'
+        '                    row_clip = t32.abs().amax(dim=1)\n'
+        '                s = (row_clip / clip_range).clamp_min(1.0 / clip_range).to(torch.float16)\n'
+        '                q = torch.clamp(torch.round(t32 / s.float()[:, None]), -clip_range, clip_range).to(torch.int8)\n'
+        '                recon = q.float() * s.float()[:, None]\n'
+        '                err = (t32 - recon).pow(2).mean().item()\n'
+        '                if err < best_err:\n'
+        '                    best_q, best_s, best_err = q, s, err\n'
+        '        return best_q, best_s\n'
+        '    amax = t32.abs().max().item()\n'
+        '    scale = torch.tensor(amax / clip_range if amax > 0 else 1.0, dtype=torch.float16)\n'
+        '    q = torch.clamp(torch.round(t32 / scale.float()), -clip_range, clip_range).to(torch.int8)\n'
+        '    return q, scale',
+        "sdclip_sweep",
+    )
+
+    # Set the global flag before export
+    source = _replace_unique(
+        source,
+        '    sd_cpu = {k: v.detach().cpu() for k, v in export_sd.items()}',
+        '    global _SDCLIP_SWEEP\n'
+        '    _SDCLIP_SWEEP = args.sdclip_sweep\n'
+        '    if args.sdclip_sweep:\n'
+        '        log0("sdclip_sweep:enabled")\n'
+        '    sd_cpu = {k: v.detach().cpu() for k, v in export_sd.items()}',
+        "sdclip_sweep",
+    )
+    return source
+
+
+# ===========================================================================
+# H10: AGGRESSIVE TTT (10 EPOCHS, COSINE LR, UNFREEZE BLOCK 1)
+#
+# Problem: No TTT exists in the base pipeline. The frontier (PR #1487)
+# gets -0.034 BPB from 10-epoch TTT with cosine LR. Our base has no TTT.
+#
+# Mechanism: After training completes, before export quantization, run TTT:
+# fine-tune the EMA checkpoint on validation data for N epochs with AdamW.
+# Freeze early blocks (configurable), use cosine LR decay within TTT.
+# ===========================================================================
+
+def patch_ttt_aggressive(source: str) -> str:
+    # Add env vars
+    source = _replace_unique(
+        source,
+        '    late_qat_threshold = float(os.environ.get("LATE_QAT_THRESHOLD", 0.15))',
+        '    late_qat_threshold = float(os.environ.get("LATE_QAT_THRESHOLD", 0.15))\n'
+        '    ttt_enabled = bool(int(os.environ.get("TTT_ENABLED", "0")))\n'
+        '    ttt_epochs = int(os.environ.get("TTT_EPOCHS", "5"))\n'
+        '    ttt_lr = float(os.environ.get("TTT_LR", "0.00045"))\n'
+        '    ttt_freeze_blocks = os.environ.get("TTT_FREEZE_BLOCKS", "0,1")\n'
+        '    ttt_cosine = bool(int(os.environ.get("TTT_COSINE", "0")))',
+        "ttt_aggressive",
+    )
+
+    # Add re import if not present
+    if 'import re\n' not in source and 'import re as' not in source:
+        source = _replace_unique(
+            source,
+            'import math\n',
+            'import math\nimport re\n',
+            "ttt_aggressive_import",
+        )
+
+    # Insert TTT loop after EMA weights are applied, before export quantization.
+    source = _replace_unique(
+        source,
+        '    full_state_dict = base_model.state_dict()\n'
+        '    export_sd = {k: v for k, v in full_state_dict.items() if "mtp_heads" not in k}',
+        '    # ---- TEST-TIME TRAINING (TTT) ----\n'
+        '    if args.ttt_enabled:\n'
+        '        freeze_blocks = set(int(b) for b in args.ttt_freeze_blocks.split(",") if b.strip())\n'
+        '        ttt_params = []\n'
+        '        frozen_count = 0\n'
+        '        for pname, p in base_model.named_parameters():\n'
+        '            m = re.match(r"blocks\\.(\\d+)\\.", pname)\n'
+        '            if m and int(m.group(1)) in freeze_blocks:\n'
+        '                p.requires_grad_(False)\n'
+        '                frozen_count += p.numel()\n'
+        '            else:\n'
+        '                p.requires_grad_(True)\n'
+        '                ttt_params.append(p)\n'
+        '        log0(f"ttt:start epochs:{args.ttt_epochs} lr:{args.ttt_lr} "\n'
+        '             f"freeze:{freeze_blocks} cosine:{args.ttt_cosine} "\n'
+        '             f"unfrozen:{sum(p.numel() for p in ttt_params)} frozen:{frozen_count}")\n'
+        '        ttt_opt = torch.optim.AdamW(ttt_params, lr=args.ttt_lr, weight_decay=0.01, fused=True)\n'
+        '        base_model.train()\n'
+        '        for ttt_epoch in range(args.ttt_epochs):\n'
+        '            if args.ttt_cosine:\n'
+        '                ttt_lr_now = args.ttt_lr * 0.5 * (1.0 + math.cos(math.pi * ttt_epoch / args.ttt_epochs))\n'
+        '                for g in ttt_opt.param_groups:\n'
+        '                    g["lr"] = ttt_lr_now\n'
+        '            total_seqs = (val_tokens.numel() - 1) // args.train_seq_len\n'
+        '            ttt_loss_sum = 0.0\n'
+        '            ttt_steps = 0\n'
+        '            for seq_start in range(0, total_seqs, 8):\n'
+        '                seq_end = min(seq_start + 8, total_seqs)\n'
+        '                raw_s = seq_start * args.train_seq_len\n'
+        '                raw_e = seq_end * args.train_seq_len + 1\n'
+        '                local = val_tokens[raw_s:raw_e].to(device=device, dtype=torch.int64)\n'
+        '                x = local[:-1].reshape(-1, args.train_seq_len)\n'
+        '                y = local[1:].reshape(-1, args.train_seq_len)\n'
+        '                ttt_opt.zero_grad(set_to_none=True)\n'
+        '                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):\n'
+        '                    loss = base_model(x, y)\n'
+        '                loss.backward()\n'
+        '                torch.nn.utils.clip_grad_norm_(ttt_params, 1.0)\n'
+        '                ttt_opt.step()\n'
+        '                ttt_loss_sum += loss.item()\n'
+        '                ttt_steps += 1\n'
+        '            log0(f"ttt:epoch:{ttt_epoch + 1}/{args.ttt_epochs} "\n'
+        '                 f"avg_loss:{ttt_loss_sum / max(ttt_steps, 1):.4f}")\n'
+        '        # Restore all params to requires_grad=True for export\n'
+        '        for p in base_model.parameters():\n'
+        '            p.requires_grad_(True)\n'
+        '        base_model.eval()\n'
+        '        log0("ttt:done")\n'
+        '    full_state_dict = base_model.state_dict()\n'
+        '    export_sd = {k: v for k, v in full_state_dict.items() if "mtp_heads" not in k}',
+        "ttt_aggressive",
+    )
+    return source
+
+
+# ===========================================================================
+# H11: INT4 EMBEDDING QUANTIZATION
+#
+# Problem: Embeddings (tok_emb) are 8192×512 = 4M params. At int8 they
+# take ~4MB (25% of the 16MB budget). At int4 they take ~2MB, freeing
+# 2MB for a larger model body or higher-precision body weights.
+#
+# Mechanism: Replace int8 embedding quantization with int4 ([-7, 7] range).
+# Per-row scale. The savings enable a 576d or 13L model in later stages.
+# ===========================================================================
+
+def patch_int4_embed(source: str) -> str:
+    # Add env var
+    source = _replace_unique(
+        source,
+        '    late_qat_threshold = float(os.environ.get("LATE_QAT_THRESHOLD", 0.15))',
+        '    late_qat_threshold = float(os.environ.get("LATE_QAT_THRESHOLD", 0.15))\n'
+        '    embed_quant_bits = int(os.environ.get("EMBED_QUANT_BITS", "8"))',
+        "int4_embed",
+    )
+
+    # Modify mixed_quantize_int6 to handle int4 embeddings.
+    # The current code sends embeds to int8 via quantize_float_tensor.
+    # We intercept embeds and use int4 when configured.
+    source = _replace_unique(
+        source,
+        '        if cat in int6_cats and t.ndim >= 1:\n'
+        '            q, s = quantize_int6_per_row(t)\n'
+        '            result[name + ".q"] = q\n'
+        '            result[name + ".scale"] = s\n'
+        '            meta[name] = {"type": "int6"}\n'
+        '        else:\n'
+        '            q, s = quantize_float_tensor(t)\n'
+        '            result[name + ".q"] = q\n'
+        '            result[name + ".scale"] = s\n'
+        '            meta[name] = {"type": "int8"}\n'
+        '    return result, meta',
+        '        if cat in int6_cats and t.ndim >= 1:\n'
+        '            q, s = quantize_int6_per_row(t)\n'
+        '            result[name + ".q"] = q\n'
+        '            result[name + ".scale"] = s\n'
+        '            meta[name] = {"type": "int6"}\n'
+        '        elif cat == "embed" and _EMBED_QUANT_BITS == 4 and t.ndim == 2:\n'
+        '            # Int4 embedding: [-7, 7] range, per-row scale with percentile sweep\n'
+        '            t32 = t.float()\n'
+        '            clip_range_4 = 7\n'
+        '            best_q4, best_s4, best_err4 = None, None, float("inf")\n'
+        '            for pct in [0.999, 0.9995, 0.9999, 1.0]:\n'
+        '                if pct < 1.0:\n'
+        '                    row_clip = torch.quantile(t32.abs(), pct, dim=1)\n'
+        '                else:\n'
+        '                    row_clip = t32.abs().amax(dim=1)\n'
+        '                s4 = (row_clip / clip_range_4).clamp_min(1.0 / clip_range_4).to(torch.float16)\n'
+        '                q4 = torch.clamp(torch.round(t32 / s4.float()[:, None]), -clip_range_4, clip_range_4).to(torch.int8)\n'
+        '                recon = q4.float() * s4.float()[:, None]\n'
+        '                err = (t32 - recon).pow(2).mean().item()\n'
+        '                if err < best_err4:\n'
+        '                    best_q4, best_s4, best_err4 = q4, s4, err\n'
+        '            result[name + ".q"] = best_q4\n'
+        '            result[name + ".scale"] = best_s4\n'
+        '            meta[name] = {"type": "int4"}\n'
+        '        else:\n'
+        '            q, s = quantize_float_tensor(t)\n'
+        '            result[name + ".q"] = q\n'
+        '            result[name + ".scale"] = s\n'
+        '            meta[name] = {"type": "int8"}\n'
+        '    return result, meta',
+        "int4_embed",
+    )
+
+    # Set the global before export
+    source = _replace_unique(
+        source,
+        '    sd_cpu = {k: v.detach().cpu() for k, v in export_sd.items()}',
+        '    global _EMBED_QUANT_BITS\n'
+        '    _EMBED_QUANT_BITS = args.embed_quant_bits\n'
+        '    if args.embed_quant_bits != 8:\n'
+        '        log0(f"int4_embed:quant_bits={args.embed_quant_bits}")\n'
+        '    sd_cpu = {k: v.detach().cpu() for k, v in export_sd.items()}',
+        "int4_embed",
+    )
+
+    # Add global variable before mixed_quantize_int6
+    source = _replace_unique(
+        source,
+        'def mixed_quantize_int6(state_dict: dict[str, Tensor], int6_cats: set[str]):',
+        '_EMBED_QUANT_BITS: int = 8  # set from args before export\n'
+        '\n'
+        'def mixed_quantize_int6(state_dict: dict[str, Tensor], int6_cats: set[str]):',
+        "int4_embed",
+    )
+    return source
+
+
+# ===========================================================================
+# H12: ACTIVATION-WEIGHTED QUANTIZATION
+#
+# Problem: The default quantizer minimizes raw reconstruction MSE per row.
+# But not all rows contribute equally to output loss — rows that see larger
+# activations have more impact on the output. Minimizing activation-weighted
+# reconstruction error is theoretically optimal (it approximates the Fisher
+# information / Hessian diagonal).
+#
+# Mechanism: Run calibration batches through the model to collect per-layer
+# input activation magnitudes. Then weight the quantization error by
+# activation magnitude: err_weighted = (act_weight * (w - w_q))^2.
+# This means rows with high-activation inputs get more careful clipping.
+#
+# Implementation: Collect E[|x|] per CastedLinear. During quantization,
+# weight the reconstruction error by the activation scale. Rows that
+# see large inputs get tighter clipping (more outlier preservation).
+# ===========================================================================
+
+def patch_gptq_post_ttt(source: str) -> str:
+    # Add env var
+    source = _replace_unique(
+        source,
+        '    late_qat_threshold = float(os.environ.get("LATE_QAT_THRESHOLD", 0.15))',
+        '    late_qat_threshold = float(os.environ.get("LATE_QAT_THRESHOLD", 0.15))\n'
+        '    gptq_post_ttt = bool(int(os.environ.get("GPTQ_POST_TTT", "0")))',
+        "gptq_post_ttt",
+    )
+
+    # Add a global dict for activation-weighted quantization, and modify
+    # quantize_int6_per_row to use it when available.
+    source = _replace_unique(
+        source,
+        'def quantize_int6_per_row(t: Tensor, clip_range: int = 31) -> tuple[Tensor, Tensor]:',
+        '_ACT_WEIGHT_MAP: dict[str, Tensor] = {}  # populated by calibration pass\n'
+        '_CURRENT_QUANT_NAME: str = ""  # set per-parameter during quantization\n'
+        '\n'
+        'def quantize_int6_per_row(t: Tensor, clip_range: int = 31) -> tuple[Tensor, Tensor]:',
+        "gptq_post_ttt",
+    )
+
+    # Modify the quantization error metric: if activation weights exist for this
+    # parameter, use weighted MSE instead of plain MSE.
+    source = _replace_unique(
+        source,
+        '            recon = q.float() * s.float()[:, None]\n'
+        '            err = (t32 - recon).pow(2).mean().item()\n'
+        '            if err < best_err:\n'
+        '                best_q, best_s, best_err = q, s, err\n'
+        '        return best_q, best_s',
+        '            recon = q.float() * s.float()[:, None]\n'
+        '            diff_sq = (t32 - recon).pow(2)\n'
+        '            # Activation-weighted error if available\n'
+        '            if _CURRENT_QUANT_NAME in _ACT_WEIGHT_MAP:\n'
+        '                aw = _ACT_WEIGHT_MAP[_CURRENT_QUANT_NAME]\n'
+        '                if aw.shape[0] == diff_sq.shape[1]:  # [cols] matches\n'
+        '                    diff_sq = diff_sq * aw[None, :]\n'
+        '            err = diff_sq.mean().item()\n'
+        '            if err < best_err:\n'
+        '                best_q, best_s, best_err = q, s, err\n'
+        '        return best_q, best_s',
+        "gptq_post_ttt",
+    )
+
+    # In mixed_quantize_int6, set _CURRENT_QUANT_NAME before each call
+    source = _replace_unique(
+        source,
+        '        if cat in int6_cats and t.ndim >= 1:\n'
+        '            q, s = quantize_int6_per_row(t)',
+        '        if cat in int6_cats and t.ndim >= 1:\n'
+        '            global _CURRENT_QUANT_NAME\n'
+        '            _CURRENT_QUANT_NAME = name\n'
+        '            q, s = quantize_int6_per_row(t)',
+        "gptq_post_ttt",
+    )
+
+    # Before quantization, collect activation stats and populate _ACT_WEIGHT_MAP
+    source = _replace_unique(
+        source,
+        '    sd_cpu = {k: v.detach().cpu() for k, v in export_sd.items()}\n'
+        '    quant_result, quant_meta = mixed_quantize_int6(sd_cpu, {"mlp", "attn"})',
+        '    sd_cpu = {k: v.detach().cpu() for k, v in export_sd.items()}\n'
+        '    if args.gptq_post_ttt:\n'
+        '        # Collect per-linear-layer input activation magnitudes\n'
+        '        log0("gptq_post_ttt:collecting activation weights for quantization")\n'
+        '        _act_accum: dict[str, Tensor] = {}\n'
+        '        _act_count: dict[str, int] = {}\n'
+        '        _cal_hooks = []\n'
+        '        def _make_cal_hook(param_name: str, in_features: int):\n'
+        '            def hook(module, inp, out):\n'
+        '                if isinstance(inp, tuple) and len(inp) > 0:\n'
+        '                    x = inp[0].float()\n'
+        '                    # Mean absolute activation per input feature\n'
+        '                    act = x.reshape(-1, x.shape[-1]).abs().mean(dim=0)  # [in_features]\n'
+        '                    if param_name not in _act_accum:\n'
+        '                        _act_accum[param_name] = torch.zeros(in_features)\n'
+        '                        _act_count[param_name] = 0\n'
+        '                    _act_accum[param_name] += act.cpu()\n'
+        '                    _act_count[param_name] += 1\n'
+        '            return hook\n'
+        '        for mod_name, module in base_model.named_modules():\n'
+        '            if isinstance(module, CastedLinear) and module.weight.ndim == 2:\n'
+        '                # The weight param name is mod_name + ".weight"\n'
+        '                wname = mod_name + ".weight"\n'
+        '                h = module.register_forward_hook(_make_cal_hook(wname, module.in_features))\n'
+        '                _cal_hooks.append(h)\n'
+        '        base_model.eval()\n'
+        '        with torch.inference_mode():\n'
+        '            cal_seqs = (val_tokens.numel() - 1) // args.train_seq_len\n'
+        '            for cs in range(0, min(32, cal_seqs), 8):\n'
+        '                ce = min(cs + 8, cal_seqs)\n'
+        '                rs = cs * args.train_seq_len\n'
+        '                re_ = ce * args.train_seq_len + 1\n'
+        '                local = val_tokens[rs:re_].to(device=device, dtype=torch.int64)\n'
+        '                x_cal = local[:-1].reshape(-1, args.train_seq_len)\n'
+        '                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):\n'
+        '                    _ = base_model.forward_logits(x_cal)\n'
+        '        for h in _cal_hooks:\n'
+        '            h.remove()\n'
+        '        # Normalize and store as activation weights\n'
+        '        global _ACT_WEIGHT_MAP\n'
+        '        for wname, accum in _act_accum.items():\n'
+        '            avg = accum / max(_act_count.get(wname, 1), 1)\n'
+        '            # Normalize so mean weight = 1 (preserves overall error scale)\n'
+        '            avg = avg / avg.mean().clamp_min(1e-12)\n'
+        '            _ACT_WEIGHT_MAP[wname] = avg\n'
+        '        log0(f"gptq_post_ttt:calibrated {len(_ACT_WEIGHT_MAP)} layers")\n'
+        '    quant_result, quant_meta = mixed_quantize_int6(sd_cpu, {"mlp", "attn"})',
+        "gptq_post_ttt",
+    )
+    return source
+
+
+# ===========================================================================
 # Registry
 # ===========================================================================
 
@@ -971,10 +1407,15 @@ PATCHES: dict[str, callable] = {
     "companding": patch_companding,
     "fisher_bits": patch_fisher_bits,
     "sparsify_before_quant": patch_sparsify_before_quant,
+    "sdclip_sweep": patch_sdclip_sweep,
+    "int4_embed": patch_int4_embed,
+    "gptq_post_ttt": patch_gptq_post_ttt,
     # Lane A (training dynamics)
     "byte_weighted_loss": patch_byte_weighted_loss,
     "tapered_mlp": patch_tapered_mlp,
     "quant_anneal": patch_quant_anneal,
     "staged_objective": patch_staged_objective,
     "best_checkpoint": patch_best_checkpoint,
+    # TTT (post-training)
+    "ttt_aggressive": patch_ttt_aggressive,
 }

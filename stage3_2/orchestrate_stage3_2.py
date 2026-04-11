@@ -53,7 +53,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--phase",
         default="plan",
-        choices=["plan", "sanity", "screen", "decision", "final_single", "champion_8x", "all"],
+        choices=["plan", "sanity", "screen", "decision", "final_single", "champion_8x", "all", "tournament"],
     )
     parser.add_argument("--label", default=datetime.now().strftime("%Y%m%d_%H%M%S"))
     parser.add_argument("--gpus", default="0,1,2,3,4,5,6,7")
@@ -179,12 +179,12 @@ def build_job(
     env["PGOLF_SLOT"] = slot_id
     env["PYTHONUNBUFFERED"] = "1"
 
-    # Resolve data paths relative to the parameter-golf root
+    # Resolve relative data/tokenizer paths against the parameter-golf root.
     pgolf_root = stage_dir.parent
     if env.get("DATA_PATH", "").startswith("./"):
-        env["DATA_PATH"] = str((pgolf_root / "data" / "datasets" / "fineweb10B_sp1024").resolve())
+        env["DATA_PATH"] = str((pgolf_root / env["DATA_PATH"][2:]).resolve())
     if env.get("TOKENIZER_PATH", "").startswith("./"):
-        env["TOKENIZER_PATH"] = str((pgolf_root / "data" / "tokenizers" / "fineweb_1024_bpe.model").resolve())
+        env["TOKENIZER_PATH"] = str((pgolf_root / env["TOKENIZER_PATH"][2:]).resolve())
     if gpu_spec is not None:
         env["CUDA_VISIBLE_DEVICES"] = gpu_spec
 
@@ -570,6 +570,8 @@ def should_run_champion(args: argparse.Namespace) -> bool:
 
 def main() -> None:
     args = parse_args()
+    if args.phase == "tournament":
+        args.phase = "all"
     script_path = Path(__file__)
     config_path = Path(args.config).resolve() if args.config else script_path.with_name("run_configs.json").resolve()
     config = load_config(config_path)
